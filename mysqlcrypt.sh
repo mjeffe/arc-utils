@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# start/stop mysql running in a LUKS encrypted container
+
 
 cmount(){
    losetup /dev/loop0 /var/lib/mysql/mycrypt

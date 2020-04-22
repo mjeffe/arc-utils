@@ -1,22 +1,30 @@
 #!/usr/bin/perl
 # ---------------------------------------------------------------------------
-# $Id$
-#
-# Extract a file from PostgreSQL as CSV
-#
+# Extract a file from PostgreSQL as CSV. This is just a convenience wrapper
+# for psql, that makes extracting CSV a one-liner. It invokes psql with a
+# COPY TO tempfile which it builds on the fly.
+# 
 # It's very frustrating that pg_dump doesn't have a CSV mode...
-#
+# 
+# Run this script with the --help options for full description
+# 
 # Dependencies:
 #
-# 1) None that I know of, but if you find one missing for example DBD::Pg
-#    then find the package to install using:
+# 1) PostgresSQL of course, and the Perl DBD driver (DBD::Pg). To install the
+#    driver I generaly use the system package manager. Find the correct
+#    package name:
 #
+#       # on redhat systems
 #       sudo yum search perl | grep -i DBD
+#       # on ubuntu systems
+#       # sudo apt-cache search perl | grep -i DBD
 #
 #    And install it
 #
+#       # on redhat systems
 #       sudo yum install perl-DBD-Pg
-#
+#       # on ubuntu systems
+#       # sudo apt-get install libdbd-pg-perl
 # ---------------------------------------------------------------------------
 
 use strict;
@@ -117,9 +125,8 @@ sub run_extract() {
    # yeah, yeah... "unsafe" to export the password.  Well don't run your damn
    # database on an unsafe server!
    # we only export if we had a command line pw, otherwise assume env vars
-   # or have been exported or .pgpass file exists, and let psql handle it
+   # have been exported or .pgpass file exists, and let psql handle it
    $ENV{PGPASSWORD} = $opts{password} if ( exists($opts{password}));
-
 
    # too many problems with quoting the sql and the shell
    #my $cmd = "unset PGOPTIONS && echo '$sql' | "
@@ -350,9 +357,39 @@ output before the CSV data.
 
 =back
 
+=head1 EXAMPLES
+
+Dump the B<users> table as comma delimited, provide the password (useful from scripts).
+
+=begin text
+
+        pgdumpcsv -d foodb -u mjeffe -t users -D ',' -p asdf > users.csv
+    
+=end text
+
+Dump the output of sql as pipe delimited (default). Let psql prompt for password.
+
+=begin text
+
+        pgdumpcsv -d foodb -u mjeffe \
+            -s 'select u.uid, r.rid from users u join roles r on u.uid = r.uid' > roles.csv
+     
+=end text
+
+
+Dump foo report as tab delimited, without the column names header row.
+
+=begin text
+
+        # enter the tab character using ctrl-v + tab, it must be in single quotes
+        pgdumpcsv -d foodb -u mjeffe \
+            -f foo_report.sql -D '	' --noheader > foo_report.csv
+    
+=end text
+
 =head1 BUGS
 
-Please report bugs or enhancement requests to Matt Jeffery - C<matt.jeffery@arkansas.gov>.
+Please report bugs to Matt Jeffery - C<matt.jeffery@arkansas.gov>
 
 =cut
 

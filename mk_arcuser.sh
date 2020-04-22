@@ -3,6 +3,8 @@
 # $Id$
 # ---------------------------------------------------------------------------
 
+. ./arc_functions.sh
+
 USAGE="
 Create a user on an ARC CentOS box, with default settings
 usage: `basename $0` [-h] [--dry-run]
@@ -10,7 +12,7 @@ with --dry-run it will echo the commands but not run them
 "
 
 if [ "$1" = "-h" ]; then
-   echo "$USAGE"
+   _say "$USAGE"
    exit
 fi
 dry_run=
@@ -24,10 +26,8 @@ echo
 echo "$USAGE"
 
 if [ `whoami` != 'root' ]; then
-   echo "You must be root to run this script"
-   exit
+   _die "You must be root to run this script"
 fi
-
 
 # verify arc group exists
 arc_group=`grep '^arc:' /etc/group`
@@ -35,14 +35,13 @@ if [ -z "$arc_group" ]; then
    read -p "No group named 'arc' exists.  Should I create it? [y/N] " answer
    if [ $answer = 'y' -o $answer = 'Y' ]; then
       if [ -n "$dry_run" ]; then
-         echo "dry run:"
+         _say "dry run:"
          echo "groupadd arc"
       else
          groupadd arc
       fi
    else
-      echo "quitting..."
-      exit
+      _die "quitting..."
    fi
 fi
 
@@ -56,10 +55,9 @@ echo
 #read -p "CSV list of additional groups: " adl_groups
 #echo
 
-
 # create user
 if [ -n "$dry_run" ]; then
-   echo "dry run:"
+   _say "dry run:"
    echo "useradd -n -g arc -c \"ARC - $full_name\" -m $username"
    echo "echo \"$password\" | passwd --stdin $username"
    echo "chage -d 0 $username"

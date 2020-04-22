@@ -14,6 +14,8 @@
 #    
 # ---------------------------------------------------------------------------
 
+. ./arc_functions.sh
+
 # defaults
 GROUP=sftpusers
 BASE_DIR=/sftp/home
@@ -39,15 +41,6 @@ randpw() {
    echo $pw
 }
 
-# ---------------------------------------------------------------------------
-# exit script with error message
-# ---------------------------------------------------------------------------
-die() {
-   echo "$1"
-   exit 1
-}
-
-
 USAGE="
 Create an SFTP user on an ARC EC2 Amazon Linux box.
 usage: `basename $0` [-h] [--dry-run]
@@ -56,7 +49,7 @@ with --dry-run it will echo the commands but not run them
 "
 
 if [ "$1" = "-h" ]; then
-   die "$USAGE"
+   _die "$USAGE"
 fi
 
 if [ "$1" = "--dry-run" ]; then
@@ -64,18 +57,18 @@ if [ "$1" = "--dry-run" ]; then
 fi
 
 if [ `whoami` != 'root' ]; then
-   die "You must be root to run this script"
+   _die "You must be root to run this script"
 fi
 
 # verify arc group exists
 user_group=`grep "^$GROUP:" /etc/group`
 if [ -z "$user_group" ]; then
-   die "No group named '$GROUP' exists, exiting..."
+   _die "No group named '$GROUP' exists, exiting..."
 fi
 
 # verify BASE_DIR exists
 if [ ! -d "$BASE_DIR" ]; then
-   die "Jailed sftp home dir '$BASE_DIR' does not exist, exiting..."
+   _die "Jailed sftp home dir '$BASE_DIR' does not exist, exiting..."
 fi
 
 echo "$USAGE"
@@ -94,18 +87,18 @@ fi
 
 # create a user WITHOUT it's home dir
 comment="SFTP - $full_name"
-$DRYRUN useradd -N -m -g $GROUP -b $BASE_DIR -s /sbin/nologin -c "$comment" $user || die "Error: on useradd $user"
-$DRYRUN echo "$password" | passwd --stdin $user || die "Error: setting password for $user"
+$DRYRUN useradd -N -m -g $GROUP -b $BASE_DIR -s /sbin/nologin -c "$comment" $user || _die "Error: on useradd $user"
+$DRYRUN echo "$password" | passwd --stdin $user || _die "Error: setting password for $user"
 
 # modify user's home dir parameter so they are chdir'ed to a writeable dir
-$DRYRUN usermod -d $USER_DIR/$user $user || die "Error: on usermod $user"
+$DRYRUN usermod -d $USER_DIR/$user $user || _die "Error: on usermod $user"
 
 # create user's home dir with appropriate permissions
-#$DRYRUN cd $BASE_DIR || die "Error: cd $BASE_DIR"
-#$DRYRUN mkdir $user || die "Error: mkdir $user"
-#$DRYRUN chown $user:$GROUP $user || die "Error: chown on $user dir"
-#$DRYRUN chmod 755 $user || die "Error: chmod on $user"
-#$DRYRUN cd $user || die "Error: cd $user"
+#$DRYRUN cd $BASE_DIR || _die "Error: cd $BASE_DIR"
+#$DRYRUN mkdir $user || _die "Error: mkdir $user"
+#$DRYRUN chown $user:$GROUP $user || _die "Error: chown on $user dir"
+#$DRYRUN chmod 755 $user || _die "Error: chmod on $user"
+#$DRYRUN cd $user || _die "Error: cd $user"
 
 echo 
 echo "Please record the username/password!"

@@ -10,7 +10,6 @@ use strict;
 use warnings;
 use File::Basename;
 
-
 # globals, set during installation
 my $arc_basedir = 'CHANGEME_ARC_BASEDIR';
 my $kim_basedir = 'CHANGEME_KIM_BASEDIR';
@@ -18,7 +17,6 @@ my $tim_basedir = 'CHANGEME_TIM_BASEDIR';
 
 sub get_path($);
 sub main();
-
 
 
 # ---------------------------------------------------------------------------
@@ -41,24 +39,22 @@ sub main() {
    exec @ARGV;
 }
 
-
 # ---------------------------------------------------------------------------
 # get path to the given progam - must be an ARC program we know about
 # ---------------------------------------------------------------------------
 sub get_path($) {
    my $prog = shift;
 
-
    # ARC generic utilities
    if    ( $prog =~ m/sqlt/ 
-        #|| $prog =~ m/pgloadcsv/ 
-        #|| $prog =~ m/pgdumpcsv/ 
+        || $prog =~ m/pgloadcsv/ 
+        || $prog =~ m/pgdumpcsv/ 
    ) {
       return $arc_basedir . "/util/$prog";
    }
    # KIM executables
    elsif ( $prog =~ m/kim/ 
-        #|| $prog =~ m/satpos/ 
+        || $prog =~ m/satpos/ 
         || $prog =~ m/unload_resolve/ 
         || $prog =~ m/stage_source/ 
    ) {

@@ -1,26 +1,38 @@
 #!/usr/bin/perl
 # ---------------------------------------------------------------------------
-# $Id$
-#
-# load a CSV file into PostgreSQL
-#
+# Load a CSV file into PostgreSQL. This is just a convenience wrapper
+# for psql, that makes loading CSV a one-liner. It invokes psql with a
+# COPY FROM tempfile which it builds on the fly.
+# 
 # It's very frustrating that pg_load doesn't have a CSV mode...
-#
-# TODO:
-#  - Need to add some output messages - x number loaded, etc. Make current -v a -vv
-#
+# 
+# Run this script with the --help options for full description
+# 
 # Dependencies:
 #
-# 1) None that I know of, but if you find one missing for example DBD::Pg
-#    then find the package to install using:
+# dmax : This is only needed if you use the --scan option. dmax is an arc
+#        utility that should be installed as part of some other arc package.
 #
+# PostgresSQL of course, and the Perl DBD driver (DBD::Pg). To install the
+#    driver I generaly use the system package manager. Find the correct
+#    package name:
+#
+#       # on redhat systems
 #       sudo yum search perl | grep -i DBD
+#       # on ubuntu systems
+#       # sudo apt-cache search perl | grep -i DBD
 #
 #    And install it
 #
+#       # on redhat systems
 #       sudo yum install perl-DBD-Pg
+#       # on ubuntu systems
+#       # sudo apt-get install libdbd-pg-perl
 #
+# TODO:
+#  - Need to add some output messages - x number loaded, etc. Make current -v a -vv
 # ---------------------------------------------------------------------------
+
 
 use strict;
 use warnings;
@@ -111,7 +123,7 @@ sub close_file($) {
 # not recommended for reading an entire file, but useful for grabbing the header row
 sub get_record($) {
    my ($fh) = @_;
-   die("$E: get_record() called with an invalid file handle\n") if ( ! fileno($fh) );
+   #die("$E: get_record() called with an invalid file handle\n") if ( ! fileno($fh) );
    chomp(my $record = <$fh>);
    return $record;
 }
@@ -679,9 +691,29 @@ the psql command line call, etc.
 
 =back
 
+=head1 EXAMPLES
+
+Create the tmp_users table and load it from the comma delimited users.csv file.
+Let psql figure out the password (see psql doc, but the usual methods are your
+.pgpass, the PGPASSWORD environment variable or prompts you for it).
+
+=begin text
+
+        pgloadcsv -d foodb -u mjeffe -c -t tmp_users -D ',' users.csv
+    
+=end text
+
+Truncate then load the existing table B<foobar>. Provide the password.
+
+=begin text
+
+        pgloadcsv -d foodb -u mjeffe -p asdf -t foobar --truncate foobar.csv
+     
+=end text
+
 =head1 BUGS
 
-Please report bugs or enhancement requests to Matt Jeffery - C<matt.jeffery@arkansas.gov>.
+Please report bugs to Matt Jeffery - C<matt.jeffery@arkansas.gov>.
 
 =cut
 

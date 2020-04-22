@@ -3,11 +3,29 @@
 #
 # Common BASH shell functions used throughout ARC code
 #
+# source this near the top of your script
+#
 # ***************************************************************************
 
 # get the name of the calling script so we can use it in log messages
 this=`basename $0`
 
+# ---------------------------------------------------------------------------
+# you should override this in your script AFTER you source this file
+# ---------------------------------------------------------------------------
+_cleanup() {
+    _say "cleaning up..."
+    _say "THIS DOES NOTHING! YOU SHOULD OVERRIDE THIS FUNCTION IN YOUR SCRIPT"
+    #rm -fr $tmpdir
+}
+
+# ---------------------------------------------------------------------------
+_my_sigint() {
+   echo "Ctrl-C pressed, aborting..."
+   _cleanup
+   exit 1
+}
+trap _my_sigint SIGINT
 
 # ---------------------------------------------------------------------------
 _die() {
@@ -19,14 +37,6 @@ _die() {
    fi
    exit $rc
 }
-
-# ---------------------------------------------------------------------------
-_my_sigint() {
-   echo "Ctrl-C pressed, aborting..."
-   _cleanup
-   exit 1
-}
-trap _my_sigint SIGINT
 
 # ---------------------------------------------------------------------------
 _say() {
@@ -91,15 +101,6 @@ _chkerr() {
 # The following should be copied and customized, not used directly
 #
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# you need to customize this
-# ---------------------------------------------------------------------------
-_cleanup() {
-    _say "cleaning up..."
-    cd $BASEDIR
-    #rm -fr $tmpdir
-}
 
 # ---------------------------------------------------------------------------
 # you need to customize this
