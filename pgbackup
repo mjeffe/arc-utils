@@ -1,0 +1,310 @@
+#!/bin/bash
+# #############################################################################
+# # Script to backup, encyrpt, sync with AWS-S3 and clean up postgres databases
+# #############################################################################
+usage(){
+   echo
+   echo "   Usage: $0 [-b] [-g] [-s] [-c] [-h] [-?] [db1] [db2] ... [dbN]"
+   echo
+   echo "   Where:"
+   echo "     -b  Performs backup of all listed databases.  Iif no "
+   echo "         databases are listed, ALL databases are backed up"
+   echo "         except those listed in the IGNORE_LIST in the"
+   echo "         configuration file."
+   echo "     -g  Include databases listed in the GLACIAL_LIST"
+   echo "     -s  Performs a sync with AWS-S3"
+   echo "     -c  Cleans up backup files (on the local server)"
+   echo "         any file older than 7 days will be deleted"
+   echo "     -h  Displays the help (this) screen"
+   echo "     -?  Displays the help (this) screen"
+   echo 
+   echo "   The order of operation will always be backup, sync and"
+   echo "   clean regardless of the order of the arguments on the"
+   echo "   command line."
+   echo
+   echo
+}
+
+# #############################################################################
+# ### Modification History 
+#
+# 2/21/2018 - Remove --create and --no-owner flags from backup commnad
+#
+
+# define and read in the configuration file
+#CONFIG_FILE=/home/glindstrom/projects/pgbackup.cfg
+CONFIG_FILE=/root/.pgbackup.cfg
+this=$0
+
+# #############################################################################
+# Give the user a way to communicate
+# 
+# _say "general messeges which always write"
+# 
+# _error "we prepend ERROR to the message and write it out"
+#
+# _fatal "we prepend FATAL to the message, write it out, and exit with rc=1
+#
+_fatal(){
+   _say "FATAL: $*"
+   exit 1
+}
+_error(){
+   _say "ERROR: $*";
+}
+_say() {
+    # create the message
+    echo `date +"%Y %m %d %H:%M:%S"`": [$this] $1"
+    logger "[$this] $*"
+}
+
+# read in the configuration file
+if [ ! -e $CONFIG_FILE ]; then
+   _fatal "config file [$CONFIG_FILE] not found"
+fi
+
+# read in the configuration file
+source "$CONFIG_FILE" || _fatal "Error reading config file $CONFIG_FILE"
+
+# parse command line options
+while getopts ":sbcgn:?" opt
+do
+   case $opt in
+      b ) BACKUP_FLAG=true
+          _say "Backup Set"
+          ;;
+      c ) CLEANUP_FLAG=true
+          _say "Cleanup Set"
+          ;;
+      g ) GLACIAL_FLAG=true
+          _say "Glacial Set"
+          ;;
+      s ) SYNC_FLAG=true
+          _say "Sync Set"
+          ;;
+      h ) usage
+          exit 1
+          ;;
+      ? ) usage
+          exit 1
+          ;;
+      * ) _error "invalid command line option"
+          usage
+          exit 1
+          ;;
+   esac
+done 2>&1   # direct and errors from the case statement to stdout
+shift $((OPTIND -1 ))  # toss the arguments we just read in
+
+# we require at least one action
+if [ ! "$BACKUP_FLAG"  = true ] && [ ! "$GLACIAL_FLAG" = true ] \
+&& [ ! "$CLEANUP_FLAG" = true ] && [ ! "$SYNC_FLAG"    = true ]; then
+   echo
+   echo "Please specify one or more of -b, -g, -s or -c"
+   usage
+   exit 1
+fi
+
+
+# #############################################################################
+# ### MAINLINE ################################################################
+# #############################################################################
+_say "Start of Run"
+
+# if directory BACKUP_HOME does not exist we create it 
+if [ ! -d $BACKUP_HOME ]; then
+    _say "creating BACKUP_HOME [$BACKUP_HOME]"
+    mkdir "$BACKUP_HOME"     || _fatal Error creating backup directory
+    chmod 770 "$BACKUP_HOME" || _fatal Error setting permission on backup directory
+fi
+
+# ensure the temp/work directory exists
+if [ ! -d "$TEMP_DIR" ]; then
+   _fatal "TEMP directory [$TEMP_DIR] Not Found"
+fi
+
+
+# #############################################################################
+# ### Create DB_LIST for all databases except those in the IGNORE_LIST and  ###
+# ### GLACIAL_LIST (we may add "glacial" databases, below).                 ###
+# #############################################################################
+if [ "$BACKUP_FLAG" = true ]; then
+   _say "backing up databases"
+
+   # if a database was not named, we do them all
+   DB_LIST=$@  # get any remaining command line arguments
+   if [ -z "$DB_LIST" ]; then
+
+      # create the db ignore list
+      _say "Ignore list [$IGNORE_LIST]" 
+      if [ -n "$IGNORE_LIST" ]; then
+         WHERE_CLAUSE="WHERE datname not in ("
+         for db in $IGNORE_LIST
+         do
+            WHERE_CLAUSE="$WHERE_CLAUSE '$db'," # add each database to ignore
+         done
+      fi
+
+      # we ignore the GLACIAL_LIST, for now...
+      if [ -n "$GLACIAL_LIST" ]; then
+
+         # if we haven't started the WHERE clause yet, we do it now.
+         if [ -z "$WHERE_CLAUSE" ]; then
+            WHERE_CLAUSE="WHERE datname not in (" 
+         fi
+
+         for db in $GLACIAL_LIST
+         do
+            WHERE_CLAUSE="$WHERE_CLAUSE '$db',"
+         done       
+      fi
+
+      # if we have created an WHERE_CLAUSE list, it will have a trailing comma...
+      if [ -n "$WHERE_CLAUSE" ]; then
+         WHERE_CLAUSE="${WHERE_CLAUSE:0:${#WHERE_CLAUSE}-1 })" # ...remove trailing comma and add )
+      fi
+
+      # call the database to get names
+      DB_LIST=`echo "SELECT datname FROM pg_database $WHERE_CLAUSE" | $PSQL -q -t -U $PGUSER`
+   fi
+fi
+
+
+# #############################################################################
+# ### Include GLACIAL Databases if the "g" flag is set.                     ###
+# #############################################################################
+if [ "$GLACIAL_FLAG" = true ] && [ -n "$GLACIAL_LIST" ]; then
+   _say "Including GLACIAL databases"
+   for db in $GLACIAL_LIST
+   do
+      DB_LIST="$DB_LIST $db"
+   done
+fi
+
+
+# #############################################################################
+# ### Create Backup Files                                                   ###
+# #############################################################################
+if [ -n "$DB_LIST" ]; then
+   # create backup files.  We create an unencrypted file in $WORK_PATH, encrypt
+   # it and place it in it's own subdirectory, then delete the unencrypted 
+   # backup. We do not want unencrypted files laying aroung; even on our own 
+   # machines.
+   for DB_NAME in $DB_LIST; do
+      _say "backup up postgres database $DB_NAME"
+
+      # if backup directory does not exist for this db, we create it 
+      PG_BACKUP_DIR="$BACKUP_HOME/$DB_NAME"
+      if [ ! -d "$PG_BACKUP_DIR" ]; then
+         _say "creating backup directory for $DB_NAME [$PG_BACKUP_DIR]"
+         mkdir $PG_BACKUP_DIR     || _fatal Error creating $PG_BACKUP_DIR
+         chmod 770 $PG_BACKUP_DIR || _fatal Setting perms on $PG_BACKUP_DIR
+      fi
+
+      # get current timestamp (ts) and create backup filename 
+      TS=$(date "+%Y%m%d%H%M")
+      PG_BACKUP_FILENAME="${DB_NAME}_$TS.sql"
+      WORK_PATH="$TEMP_DIR/$PG_BACKUP_FILENAME"
+      ENCRYPT_PATH="$PG_BACKUP_DIR/$PG_BACKUP_FILENAME".gpg
+      _say "work path: [$WORK_PATH]"
+
+      # run backup.  this creates an unencrypted file
+      #$PGDUMP -U  $PGUSER --create --clean --no-owner "$DB_NAME" > "$WORK_PATH" \
+      $PGDUMP -U  $PGUSER --clean "$DB_NAME" > "$WORK_PATH" \
+         || _say Error creating backup
+
+      # encrypt the file ("symmetric" encryption because the file is for us, only).
+      $PGPG --batch --passphrase "$GPG_PASSPHRASE" --output "${ENCRYPT_PATH}" \
+            --symmetric "$WORK_PATH" || _fatal Error encypting file
+
+      # Delete the non-encrypted backup file
+      rm "$WORK_PATH" || _error Unable to delete "$WORK_PATH"
+
+   done # done backing up a single database
+fi # done backing all requested databases
+
+
+# #############################################################################
+# ### SYNC BACKUPS WITH AWS-S3 ################################################
+# #############################################################################
+if [ "$SYNC_FLAG" = true ]; then
+   _say "Syncing $BACKUP_HOME with AWS-S3 $S3DEST"
+
+   # change to source directory and verify it exists
+   cd "$SRC_DIR" || _fatal "Cannot cd to SRC_DIR [$SRC_DIR]"
+
+   # we insist on a destination directory (S3DEST)
+   if [ -z "$S3DEST" ]; then
+     _fatal "No S3 DESTINATION DIRECTORY Specified. See Config File [$CONFIG_FILE]"
+   fi
+
+   "$AWS" s3 sync "$BACKUP_HOME" "$S3DEST" || _fatal "Error executing sync to s3"
+fi # end of sync routine
+
+
+# #############################################################################
+# ### Cleanup Old Files #######################################################
+# #############################################################################
+if [ "$CLEANUP_FLAG" = true ]; then
+   _say "Cleanup backups on `hostname`"
+
+   # define a routine to clean each directory, then we'll loop through them all.
+   _cleandir() {
+      dir="$1"
+      retention_days="$2"
+      if [ -z "$retention_days" ]; then
+      retention_days=30
+      fi
+
+      if [ ! -d "$dir" ]; then
+         _say "$this: $dir does not exist, skipping..."
+         return
+      fi
+
+      if [ -z "$dir" ]; then
+         _say "$this: dir parameter is empty, skipping..."
+         return
+      fi
+
+      cd $dir || _fatal "Error changing to $dir"
+
+      _say "cleaning up $dir"
+      _say "$LSDATE -g $retention_days | xargs -i rm -vf '{}'"
+      $LSDATE -g $retention_days | xargs -i rm -vf '{}' 
+      _say "`date`: finished"
+   }
+
+   # now go through all of the backup sub-directories
+   cd "$BACKUP_HOME" || _fatal Error changing to [$BACKUP_HOME]
+   for pg_directory in $(ls -d */)
+   do
+     _say "Processing $pg_directory"
+     #_cleandir "$BACKUP_HOME/$pg_directory" 7 
+
+     retention_days=7
+
+     # verify the directory exists
+     if [ ! -d "$BACKUP_HOME"/"$pg_directory" ]; then
+        _say "$this: $BACKUP_HOME/$pg_directory does not exist, skipping..."
+        continue # next directory, please
+     fi
+
+     # switch to this directory
+     cd "$BACKUP_HOME"/"$pg_directory" 
+     if [ $? -ne 0 ]; then
+        _error "Error changing to $BACKUP_HOME/$pg_directory .... skipping"  
+        continue
+     fi
+
+     _say "cleaning up $BACKUP_HOME/$pg_directory"
+     _say "$LSDATE -g $retention_days | xargs -i rm -vf '{}'"
+     $LSDATE -g $retention_days | xargs -i rm -vf '{}' 
+     _say "`date`: finished"
+
+   done  # done cleaning up a specific backup directory
+fi # done cleaning up all backup directories
+
+
+# that's it.  that's all 'ya gotta do!
+_say "End of Run"
+

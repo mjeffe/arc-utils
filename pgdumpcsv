@@ -1,0 +1,361 @@
+#!/usr/bin/perl
+# ---------------------------------------------------------------------------
+# $Id$
+#
+# Extract a file from PostgreSQL as CSV
+#
+# It's very frustrating that pg_dump doesn't have a CSV mode...
+#
+# Dependencies:
+#
+# 1) None that I know of, but if you find one missing for example DBD::Pg
+#    then find the package to install using:
+#
+#       sudo yum search perl | grep -i DBD
+#
+#    And install it
+#
+#       sudo yum install perl-DBD-Pg
+#
+# ---------------------------------------------------------------------------
+
+use strict;
+use warnings;
+
+
+use FileHandle;
+use File::Basename;
+use Getopt::Long;
+use File::Temp qw/ tempfile tempdir /;
+use Data::Dumper;
+
+# globals
+my $this = basename($0);
+my $VERSION = '$Id$';
+my %opts = ();
+my $E = "$this ERROR";   # prefix for error message
+
+# autoflush stdout so that progress can be watched accurately
+# Use $| = 1; if not use'ing FileHandle.
+STDOUT->autoflush(1);
+
+# prototypes
+sub usage();
+sub get_opts();
+sub run_extract();
+sub get_copyto_tempfile();
+sub system_call($$);
+
+
+# #################################################
+# MAIN
+# #################################################
+
+# parse command line parms
+get_opts();
+
+#my $file = shift;
+#die("$E: no file on command line to load\n") unless ($file);
+
+run_extract();
+
+
+
+
+# #################################################
+# FUNCTIONS
+# #################################################
+
+
+# ---------------------------------------------------------------------------
+# generates a temp file with the COPY TO command and returns the file name
+# ---------------------------------------------------------------------------
+sub get_copyto_tempfile() {
+
+   my $sql = "copy";
+
+   if ( exists($opts{table}) ) {
+      $sql .= " $opts{table}";
+   }
+   elsif ( exists($opts{sql}) ) {
+      $sql .= " ($opts{sql})";
+   } else {
+      my $select = "";
+      open(SQL, "<", $opts{file}) or die("$E: Can't open input file $opts{file}: $!\n");
+      while (my $line = <SQL>) {
+         $select .= $line;
+      }
+      close(SQL) or die("$E: Can't open input file $opts{file}: $!\n");
+      $sql .= "($select)";
+   }
+   $sql .= " to STDOUT with delimiter '$opts{delimiter}'";
+   $sql .= " null as '$opts{nullas}'" if ( exists($opts{nullas}) );
+   $sql .= " csv";
+   $sql .= " header" if ( $opts{header} );
+   $sql .= " quote '$opts{quote}'" if ( exists($opts{quote}) );
+   $sql .= " escape '$opts{escape}'" if ( exists($opts{escape}) );
+   # only works in 9.1
+   #$sql .= " force quote *" if ( exists($opts{'force-quote'}) );
+   $sql .= " force quote $opts{'force-quote'}" if ( exists($opts{'force-quote'}) );
+   $sql .= ';';
+   print "COPY SQL: $sql\n" if ( $opts{verbose} > 0 );
+
+   # write to temp file
+   my ($fh, $filename) = tempfile(UNLINK => 1, SUFFIX => '.sql');
+   print $fh "$sql\n";
+   return $filename;
+}
+
+# ---------------------------------------------------------------------------
+# Invokes psql with COPY TO tempfile, writing to stdout
+# ---------------------------------------------------------------------------
+sub run_extract() {
+   #my ($file) = @_;
+   
+   my $sqlfile = get_copyto_tempfile();
+
+   # yeah, yeah... "unsafe" to export the password.  Well don't run your damn
+   # database on an unsafe server!
+   # we only export if we had a command line pw, otherwise assume env vars
+   # or have been exported or .pgpass file exists, and let psql handle it
+   $ENV{PGPASSWORD} = $opts{password} if ( exists($opts{password}));
+
+
+   # too many problems with quoting the sql and the shell
+   #my $cmd = "unset PGOPTIONS && echo '$sql' | "
+   #        . "psql --pset pager=off -X -h $opts{host} -U $opts{username} -d $opts{dbname}";
+
+   my $cmd = "unset PGOPTIONS && "
+           . "psql --pset pager=off -X -U $opts{username} -d $opts{dbname} -f $sqlfile";
+   $cmd .= " -h $opts{host}" if ( exists($opts{host}) );
+
+   # convert to dos format
+   if ( exists($opts{dos}) ) {
+      $cmd .= ' | perl -ne \'chomp; print; print "\r\n";\'';
+   }
+
+   # output to file rather than stdout
+   if ( exists($opts{outputfile}) ) {
+      $cmd .= " > $opts{outputfile}";
+   }
+
+   system_call($cmd, "psql");
+}
+
+
+
+# ---------------------------------------------------------------------------
+#  Run system command
+# ---------------------------------------------------------------------------
+sub system_call($$) {
+   my ($cmd, $app) = @_;
+
+   print "CMD: $cmd\n" if ( $opts{verbose} > 0 );
+   my $rc = system($cmd);
+   if ( ($rc >>= 8) != 0 ) {
+      die("$E: $app failed with return code $?: $!\n");
+   }
+}
+
+
+# ---------------------------------------------------------------------------
+# get, verify and set defaults on command line options
+sub get_opts() {
+
+   Getopt::Long::Configure('no_ignore_case','no_auto_abbrev','gnu_getopt');
+   my $ok = GetOptions(\%opts,
+      # info options
+      'help|?',
+      'version|V',
+      # db info
+      'username|u|U=s',
+      'password|p=s',
+      'dbname|d=s',
+      'host|h=s',
+      # output file options
+      'verbose|v+',     # the trailing + allows multiple -v 
+      'header!',        # include header in output
+      'dos',            # include windows line terminators \r\n
+      'delimiter|D=s',  # define the delimiter character
+      'quote|q=s',      # define the quote character
+      'escape|e=s',     # define the escape character
+      'nullas=s',       # define the NULL string
+      'force-quote|Q=s',  # always quote fields, not just when embeded characters are found
+      'outputfile|o=s', # output to file name rather than stdout
+      # other options
+      'table|t=s',      # which table to extract
+      'file|f=s',       # extract result of the sql in this file.
+      'sql|s=s',        # extract result of the sql in this string.
+   );
+   exit(1) if not $ok;
+   usage() if ( exists($opts{help}) );
+   die("$VERSION\n") if ( exists($opts{version}) );
+
+   # required parms
+   die("$E: --username is a required parameter\n") 
+      unless(exists($opts{username}));
+   die("$E: --dbname is a required parameter\n") 
+      unless(exists($opts{dbname}));
+   die("$E: missing parameter: you must use one of --table or --file.\n") 
+      unless(exists($opts{table}) or exists($opts{sql}) or exists($opts{file}));
+
+
+   # set defaults
+   $opts{verbose} = 0 unless(exists($opts{verbose}));
+   $opts{delimiter} = '|' unless(exists($opts{delimiter}));
+   #$opts{host} = 'localhost' unless(exists($opts{host}));
+   $opts{header} = 1 unless(exists($opts{header}));
+
+   #print Dumper(\%opts); die("bye\n");
+}
+
+
+# ------------------------------------------------------------------------
+sub usage() {
+   eval "use Pod::Usage qw( pod2usage )";
+
+   if ( $@ ) {
+       print <<"END";
+
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+* Sorry cannot display help - Pod::Usage was not found.
+* Try running "perldoc $this", or just view the bottom of $this.
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+
+END
+   } else {
+      print "\n";
+      pod2usage( -exitval => 'NOEXIT',
+                 -verbose => 3,
+                 #-output  => '-',
+                 -output  => \*STDOUT,
+               );
+   }
+
+   exit 1;
+}
+
+
+
+__END__
+
+=pod
+
+=head1 NAME
+
+pgdumpcsv - extract data from a PostgreSQL database in a delimited format
+
+=head1 USAGE
+
+usage: pgdumpcsv <options> > /some/file.csv
+
+=head1 DESCRIPTION
+
+pgdumpcsv extracts data from a PostgreSQL database and writes it to STDOUT, in a
+delimited format.  It essentially generates a "COPY TO" command, which it then
+submits to psql.  For more information, see PostgresSQL's COPY command
+documentation.
+
+=head1 OPTIONS
+
+=over
+
+=item B<-d,--dbname=NAME>
+
+The database name. Required.
+
+=item B<-u,-U,--username=NAME>
+
+The database user name. Required.
+
+=item B<-p,--password=STRING>
+
+The database user's password. If the B<--passsword> option is not present,
+normal postgresql mechanisms apply, that is we let psql find the password. In
+short, the command line option overrides the PGPASSWORD environment variable,
+which overrides the .pgpass file.  The PGPASSFILE environment variable will
+override the default location and name of $HOME/.pgpass
+
+=item B<-h,--host=NAME>
+
+Specifies the host name of the machine on which the server is running.
+
+=item B<-t,--table=NAME>
+
+The table you want to extract.  One of -t, -f or -s is required.
+
+=item B<-f,--file=NAME>
+
+A file containing a sql query defining what you want to extract.  One of -t, -f or -s is required.
+
+=item B<-s,--sql='select some columns from ...'>
+
+An sql query defining what you want to extract.  NOTE: do not include a final ';' as you would in psql.
+One of -t, -f or -s is required.
+
+=item B<-D,--delimiter='C'>
+
+Define the delimiter character.  Defaults to '|'
+
+=item B<-q,--quote='C'>
+
+Define the quote character.  Defaults to '"'
+
+=item B<-e,--escape='C'>
+
+Define the escape character.  Defaults to '"'
+
+=item B<--header>
+
+Include header row with field names.  This is on by default.  Use --noheader to
+negate this behaviour.
+
+=item B<--nullas='STRING'>
+
+Ouput nulls as STRING.  Normally a null would just be an empty string, but you
+can specify some string to use instead. See NULL AS option to PostgresSQL's
+COPY command.
+
+=item B<-Q,--force-quote='column1[,column2,...]'>
+
+Force listed columns to be quoted.  Normaly, a field will only be wrapped in
+quotes if it contains an embeded delimiter or a quote character.  This option
+forces the listed columns to be wrapped in quotes regardless of what is in the
+field.  Having to list the columns is a retarded way to implement this, but
+it's due to the limitations of PostgreSQL's COPY command.  In PG 9.1, you can
+now specify '*' as the column list, but in 8.4 we have to list out the columns
+you want quoted.
+
+=item B<--dos>
+
+Generate output appropriate for a DOS (Microsoft Windows) environment by
+terminating records with \r\n (carriage return, line feed). By default, output
+is generated with \n (new line or line feed) as the record terminator, which is
+appropriate for Unix like environments.
+
+=item B<-?,--help>
+
+Displays this help message.
+
+=item B<-V,--version>
+
+Displays the version information
+
+=item B<-v,--verbose>
+
+Will print additional information to STDOUT, such as the composed COPY TO
+command, the psql command line call, etc.  This is mostly debug information.
+NOTE that these printed lines are sent to STDOUT so they will appear in your
+output before the CSV data.
+
+=back
+
+=head1 BUGS
+
+Please report bugs or enhancement requests to Matt Jeffery - C<matt.jeffery@arkansas.gov>.
+
+=cut
+
+ 
+
+

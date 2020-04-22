@@ -1,0 +1,531 @@
+#! /usr/bin/perl
+
+# ===================================================================
+# $Id: template_psql 136 2011-09-01 16:33:42Z mjeffe $
+#
+# sqlt is a database front end, which will parse a sql template file using
+# Text::ScriptTemplate, before submitting it to the db.  It is primarily
+# intended to be used in batch processes. You can use sqlt instead of the
+# normal db interface, but it's not a replacement for it.  sqlt's job is the
+# template parsing, and some other magic, but it depends on the db's access
+# tool to actually run the sql - psql for postgresql, sqlplus for oracle, etc.
+#
+# I have used this concept with various database vendors, and it works well.
+# I intend to combine all those scripts into this one, however, at the
+# present time, only postgresql is supported.
+#
+# Dependencies:
+#
+# 1) The ARC Perl libs. On our servers this should already be in your path. I
+#    usually install this under /usr/local/src/arc/ and symnlink it to
+#    /user/local/perllib. I also add PERL5LIB to /etc/profile.d/arc.sh. But
+#    locally, you should update your PERL5LIB in ~/.bashrc or ~/.bash_profile
+#
+#       export PERL5LIB=$PERL5LIB:/usr/local/perllib
+#
+# 2) The Perl DBI/DBD stuff for your db
+#
+#       sudo yum install perl-DBI
+#       sudo yum install perl-DBD-Pg
+#
+# 3) The rest should be part of Perl core, but if you find one missing for
+#    example DBD::Pg then find the package to install using:
+#
+#       sudo yum search perl | grep -i DBD
+#
+#    And install it
+#
+#       sudo yum install perl-DBD-Pg
+#
+# ===================================================================
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use File::Basename;
+#use Text::ScriptTemplate;
+use Env;
+use DBI;
+use Data::Dumper;
+
+# include ARC libs
+use FindBin;
+use lib "$FindBin::Bin/../perllib";
+use ARC::Common;
+use Text::PerlTemplate;
+
+# prototypes
+sub main();
+sub get_opts();
+sub usage();
+sub parse();
+sub explain($);
+sub print_to_tempfile($);
+sub get_cmd();
+sub get_dbh();
+# vendor specific functions
+sub pg_mk_pgpass();
+sub pg_rm_pgpass();
+
+# globals
+my $this = basename($0);
+my $E = "$this ERROR";
+my %opts = ('stdin' => 0);  # command line options
+
+# invoke main
+main;
+
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+sub main() {
+   get_opts();
+   pg_mk_pgpass();
+
+   # make defines available in the template by createing global perl variables
+   foreach my $key (keys %{ $opts{define} } ) {
+      #print "Define: $key = $opts{D}{$key}\n";
+      no strict 'refs';
+      $$key = $opts{define}{$key};
+      use strict 'refs';
+   }
+
+   # Make a database connection available to the template.  This can be useful
+   # when the template code wants to get counts from tables, generate column
+   # names from the information schema, etc.
+   $Sqlt::dbh = get_dbh();
+
+   my $sql = parse();
+
+   if ( exists($opts{explain}) ) {
+      $sql = explain($sql);
+   }
+
+   # if this is just a test run, print and exit
+   if ( exists($opts{test}) ) {
+      print $sql;
+      exit 0;
+   }
+   else {
+      print_to_tempfile($sql);
+   }
+
+   $Sqlt::dbh->disconnect();
+
+   # we are ready to run
+   my $rc = system get_cmd();
+
+   # cleanup
+   if ( ! exists($opts{ofile}) ) {
+      unlink $opts{tempfile};
+   }
+   pg_rm_pgpass();
+
+   exit $rc >> 8;
+}
+
+
+# ---------------------------------------------------------------------------
+# return a databse handle for the given db vendor
+# ---------------------------------------------------------------------------
+sub get_dbh() {
+   my $driver = '';
+
+   if ( $opts{dbvendor} =~ m/^(pg|postgres)/i ) {
+      $driver = "DBI:Pg:dbname=$opts{dbname};host=$opts{host}";
+   }
+   elsif ( $opts{dbvendor} =~ m/^(mysql)/i ) {
+      $driver = "DBI:mysql:$opts{dbname};host=$opts{host};mysql_read_default_group=client";
+   }
+   elsif ( $opts{dbvendor} =~ m/^(oracle)/i ) {
+      $driver = "dbi:Oracle:";
+   }
+   else {
+      die("$E: unsupported database vendor\n");
+   }
+
+   my $ret = DBI->connect(
+      $driver,
+      $opts{user},
+      $opts{pass} || '',
+      {
+         PrintError => 0,
+         RaiseError => 1
+      }
+   );
+   return $ret;
+}
+
+# ---------------------------------------------------------------------------
+# generate the command line for the given db
+#
+# use exec, so that shell doesn't hang around and expose the password to ps.
+# ---------------------------------------------------------------------------
+sub get_cmd() {
+   my $cmd = '';
+
+   if ( $opts{dbvendor} =~ m/^(pg|postgres)/i ) {
+      # we don't want the user's environment interfering
+      $cmd = "unset PGOPTIONS && exec psql --pset pager=off -X";
+
+      # these are good for batch, but they are best left up to the user
+      #cmd .= "--unbuffered --batch --show-warnings --line-numbers --disable-auto-rehash";
+      #$cmd .= "psql --set AUTOCOMMIT=off --set ON_ERROR_STOP=on";
+
+      # since $this is intended for use in batch processing, don't allow psql to
+      # prompt for password, just die if it wasn't passed and it's not available
+      # by other means such as a .pgpass file.  -w is the short version
+      $cmd .= " --no-password";
+
+      # echo everything 
+      # -a is equivalent to export ECHO=all
+      # -e is equivalent to export ECHO=queries
+      $cmd .= " -a" unless ( exists($opts{silent}) );
+
+      $cmd .= " -U $opts{user} -d $opts{dbname} -h $opts{host} -f $opts{tempfile}";
+      #die("CMD: $cmd\n");
+   }
+
+   elsif ( $opts{dbvendor} =~ m/^(mysql)/i ) {
+      $cmd = "exec mysql";
+      $cmd .= " -vvv -t" unless ( exists($opts{silent}) );
+      $cmd .= " --unbuffered --batch --show-warnings --line-numbers --disable-auto-rehash";
+      $cmd .= " -u $opts{user} -h $opts{host} --password=$opts{pass} $opts{dbname} < $opts{tempfile}";
+   }
+   else {
+      die("$E: unsupported database vendor\n");
+   }
+
+   return $cmd;
+}
+
+# ---------------------------------------------------------------------------
+# create a pgpass file from parameters in %opts
+#
+# If a user has passed us a password, we want to use that for both our
+# temporary DBI connection as well as when we finally submit the sql.  Since
+# psql does not accept password as a command line arg, we have to create a
+# pgpass file that will override any that might be in the environment.
+#
+# pgpass file format:
+#    hostname:port:database:username:password
+# ---------------------------------------------------------------------------
+sub pg_mk_pgpass() {
+
+   # always create the filename opts entry so pg_rm_pgpass() doesn't fail
+   $opts{pgpass} = dirname($opts{tempfile}) . "/.pgpass." . basename($opts{tempfile});
+
+   if ( ! exists($opts{pass}) || $opts{dbvendor} !~ m/^(pg|postgres)/i ) {
+      return;
+   }
+
+   open(PGPASS, ">", $opts{pgpass}) or die("$E: Can't open pgpass file $opts{pgpass}: $!\n");
+   print PGPASS "$opts{host}:*:$opts{dbname}:$opts{user}:$opts{pass}\n";
+   close(PGPASS) or die("$E: Can't close pgpass file $opts{pgpass}: $!\n");
+   chmod(0600, $opts{pgpass}) or die("$E: Can't chmod on PGPASS file $opts{pgpass}\n");
+
+   # reset the environment
+   $ENV{PGPASSFILE} = $opts{pgpass};
+}
+
+# ---------------------------------------------------------------------------
+# cleanup after pg_mk_pgpass()
+# ---------------------------------------------------------------------------
+sub pg_rm_pgpass() {
+   unlink $opts{pgpass};
+}
+
+
+# ---------------------------------------------------------------------------
+# insert explain plan code
+# ---------------------------------------------------------------------------
+sub explain($) {
+   my $sql = shift;
+
+   # TODO: add explain code
+
+   return $sql;
+}
+
+# ---------------------------------------------------------------------------
+# parse 
+# ---------------------------------------------------------------------------
+sub parse() {
+   # generate the sql
+   if ( $opts{stdin} ) {
+     return Text::PerlTemplate::parseFromFile(\*STDIN);
+   } else {
+     return Text::PerlTemplate::parseFromFile($opts{ifile});
+   }
+}
+
+# ---------------------------------------------------------------------------
+# there are several advantages to calling psql with the -f option, rather
+# than reading from stdin, so create one if user has not requested ofile
+# ---------------------------------------------------------------------------
+sub print_to_tempfile($) {
+   my $sql = shift;
+
+   #print "generating $opts{tempfile}\n";
+   open(TMPFILE, ">", $opts{tempfile}) or 
+      die("$E: Can't open tempfile $opts{tempfile}: $!\n");
+   print TMPFILE $sql;
+   close(TMPFILE) or
+      die("$E: Can't close tempfile $opts{tempfile}: $!\n");
+
+   # basic check
+   if ( ! -r $opts{tempfile} ) {
+      die("$E: problem generating $opts{tempfile}\n"); 
+   }
+}
+
+
+# ---------------------------------------------------------------------------
+# parse command line opts, check for required, set defaults, etc.
+# ---------------------------------------------------------------------------
+sub get_opts() {
+
+   # need to add .pgpass file option, check for PGPASSFILE in environment, etc
+
+   #Getopt::Long::Configure('no_ignore_case','no_auto_abbrev','bundling');
+   Getopt::Long::Configure('no_ignore_case','no_auto_abbrev','gnu_getopt');
+   my $ok = GetOptions(\%opts,
+      'help|?',         # print usage message
+      'define|D=s%',    # does not allow -D foo (if we made -D args optional, Getopts would assign foo = '' not 1)
+      'user|u=s',       # username - allow all in one user[@db]/pass format
+      'pass|p=s',       # password
+      'host|h=s',       # database host
+      'dbname|d=s',     # database name
+      'dbvendor|V=s',   # database vendor - postgresql, mysql, oracle, etc.
+      'explain|x=s',    # insert explain plan code into the sql
+      'ofile|o=s',      # output file
+      'silent|s',       # suppress default usage of psql's -a
+      'test|t',         # print parsed sql, but don't run
+   );
+   if ( not $ok )                   { die("$E: error during command line parsing\n"); }
+   $opts{ifile} = shift(@ARGV);
+   if ( exists($opts{help}) )       { usage(); }
+
+   # set defaults
+   $opts{dbvendor} = $opts{dbvendor} || 'postgres';
+   $opts{host} = $opts{host} || 'localhost';
+
+   # username, password and database name
+   if ( ! exists($opts{user}) )     { die("$E: --user is required\n"); }
+   if ( (index($opts{user}, '/') > 0) ) {
+      # parse user@db/password form
+      ($opts{user}, $opts{pass}) = split ('/', $opts{user});
+
+      # peel off database name, if present.
+      $opts{user} =~ s/@(.*)$//;
+      $opts{dbname} = $1 || '';
+   }
+   if ( ! exists($opts{dbname}) )   { die("$E: --dbname is required\n"); }
+
+   # input - file or stdin
+   die("$E: missing sql file or - for stdin\n") if ( ! defined($opts{ifile}) );
+   if ( $opts{ifile} eq '-' ) { 
+      $opts{stdin} = 1; 
+   } 
+   else {
+      die("$E: Can't read sql file $opts{ifile}\n") if ( ! -r $opts{ifile} );
+   }
+
+   # generate tempfile name
+   if ( $opts{ofile} ) {
+      $opts{tempfile} = $opts{ofile};
+   }
+   else {
+      my $base = basename($opts{ifile}) || 'STDIN.sql';
+      $opts{tempfile} = File::Spec->tmpdir() . "/.temp.$$.$base";
+   }
+
+   #print Dumper(\%opts);
+}
+
+# ------------------------------------------------------------------------
+sub usage() {
+   eval "use Pod::Usage qw( pod2usage )";
+
+   if ( $@ ) {
+      print <<"END";
+
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+* Sorry cannot display help - Pod::Usage was not found.
+* Try running "perldoc $this", or just view the bottom of $this.
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+
+END
+   } 
+   else {
+
+      print "\n";
+      pod2usage( -exitval => 'NOEXIT',
+                 -verbose => 3,
+                 -output  => '-',
+                 #-output  => \*STDOUT,
+               );
+   }
+   exit 1;
+}
+
+
+
+__END__
+
+=pod
+
+=head1 NAME
+
+sqlt - A SQL preprocessor using Text::ScriptTemplate to allow embedding Perl
+within SQL files in the style of php, asp, jsp, etc.
+
+=head1 USAGE
+
+sqlt -u user@db/password [-D var=value ...] [-sthx] [-o ofile] script|- 
+
+=head1 DESCRIPTION
+
+sqlt is a tool which will pass a sql script through the Text::ScriptTemplate
+pre-processor, making any template substitutions before submitting it to the
+database.  It is primarily intended to be used in batch processes. You can use
+sqlt instead of the normal db interface, but it's not a replacement for it.
+sqlt's job is the template parsing, and some other magic, but it depends on the
+db's access tool (psql for PostgreSQL, mysql for MySQL, SQL*Plus for Oracle,
+etc.) to actually run the sql. 
+
+Using Text::ScriptTemplate, sqlt allows you to use Perl code in your sql
+scripts.  Similar to ASP or JSP, the tags C<< <% >> and C<< %> >> delimit any
+Perl code.  If the opening delimiter includes an equal sign, as in C<< <%= %>
+>>, any code or variables found between these delimiters is interpreted and the
+result placed back into the SQL.  Without the equal sign, the Perl code will
+still be executed, but any result string will be discarded.  For example:
+
+  select * from <%= $table_name %>;
+
+  <% if ( $table_name =~ m/_vw$/i ) { %>
+  drop view $table_name;
+  <% } else { %>
+  drop table $table_name;
+  <% } %>
+
+sqlt uses Perl's Env module, making environment variables directly 
+available within the SQL. For example:
+
+   -- --------------------------------------------------------
+   -- save user information in the log file
+   --
+   -- User        : <%= $USER %>
+   -- User's shell: <%= $SHELL %>
+   -- User's path : <%= $PATH %>
+   -- --------------------------------------------------------
+
+   select count(*) from $MY_TABLE_NAME;
+
+sqlt makes a normal DBI database handle named $Sqlt::dbh available to any Perl
+code within the SQL. This can be useful when the template code wants to get
+counts from tables, generate column names from the information schema, etc.
+
+   <%
+      my $sth = $Sqlt::dbh->prepare('SELECT max(id) as max_id FROM $table_name');
+      $sth->execute() or die "Couldn't execute statement: " . $sth->errstr;
+      my ($maxid) = $sth->fetchrow_array();
+   %>
+
+   insert into $table_name (id, value)
+   values (<%= $maxid + 1 %>, $the_value);
+
+Since the template language is perl, you can do anything perl can do: use
+additional modules, set globals, define functions, etc:
+
+   <% 
+      use Some::module;
+      my @columns = qw(id fname lname);
+
+      sub foo () {
+         return $something_cool;
+      }
+   %>
+
+   select <%= join(',', @columns) %> from my_table;
+
+   <% if ( Some::module->some_function() ) { %>
+   -- about to do something
+   <% } else { %>
+   -- nevermind
+   <% } %>
+
+   insert <%= foo() %> into bar;
+
+=head1 COMMAND LINE OPTIONS
+
+=over
+
+=item B<-D,--define=string>
+
+Set a Perl variable to a specific string value. These are like C pre-processor
+defines.  Using C<-D table_name=my_table> makes the variable $table_name
+available in the SQL.  Using C<-D drop_temp_tables> will cause sqlt to set the
+variable $drop_temp_tables = 1 (TRUE in Perl).
+
+=item B<-o,--ofile=/path/to/file>
+
+Save parsed template as /path/to/file before invoking database
+
+=item B<-u,--user=username[@db/password]>
+
+The database username.  Allows all in one user[@dbname]/pass format.  If dbname
+and password are included in this option, they take prcedence over the --dbname
+and --pass options if they also happend to be on the command line.
+
+=item B<-p,--pass=password>
+
+The database password.  Optional if database has some other mechanism
+for getting the password.  For example, the .pgpass file for PostgreSQL.
+
+=item B<-d,--dbname=name>
+
+The name of the database to connect to.  Optional if all-in-one format of
+--user was used.
+
+=item B<-h,--host=name>
+
+The name of the database host. Defaults to localhost.
+
+=item B<-t,--test>
+
+Test, sends output to stdout, does not actually execute the sql.
+
+=item B<-s,--silent>
+
+By default, echo options are turned on (-vvv -t for mysql, -a for PostgreSQL, etc).
+This option turns those off.
+
+=item B<-?,--help>
+
+Print this help message.
+
+=item B<-V, --dbvendor=STRING>
+
+Which databse we are connecting to.  The following are implemented:
+
+   postgresql  - default
+   mysql
+   oracle
+
+=item B<-x, --explain>
+
+Insert explain plan code into the SQL.
+
+=item B<- | script>
+
+If C<-> then read from stdin, otherwise read sql C<script>.
+
+=back
+
+=cut
+

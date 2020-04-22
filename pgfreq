@@ -1,0 +1,731 @@
+#!/usr/bin/perl
+# ---------------------------------------------------------------------------
+# $Id$
+#
+# run a frequency analysis on a database table
+# 
+# This is a very simplistic approach, as we simply run a count(*) group by
+# on each column in the table.
+#
+# Dependencies:
+#
+# 1) The ARC Perl libs, I usually install these under /user/local/bin
+#    Update your PERL5LIB in ~/.bashrc or ~/.bash_profile:
+#
+#       export PERL5LIB=$PERL5LIB:/usr/local/perllib
+#
+# 2) The Perl DBI/DBD stuff for your db
+#
+#       sudo yum install perl-DBI
+#       sudo yum install perl-DBD-Pg
+#
+# 3) The rest should be part of Perl core, but if you find one missing for
+#    example DBD::Pg then find the package to install using:
+#
+#       sudo yum search perl | grep -i DBD
+#
+#    And install it
+#
+#       sudo yum install perl-DBD-Pg
+#
+# ---------------------------------------------------------------------------
+
+use strict;
+use warnings;
+
+
+use FileHandle;
+use File::Basename;
+use Getopt::Long;
+use File::Temp qw/ tempfile tempdir mktemp /;
+use Data::Dumper;
+use DBI;
+
+# include ARC libs
+use FindBin;
+use lib "$FindBin::Bin/../perllib";
+use ARC::Common;
+
+# globals
+my $this = basename($0);
+my $VERSION = '$Id$';
+my %opts = ();
+my $null_str = '<null>';
+my $extra_str = '<all other values>';
+
+my $E = "$this ERROR";
+
+# autoflush stdout so that progress can be watched accurately
+# Use $| = 1; if not use'ing FileHandle.
+STDOUT->autoflush(1);
+
+# prototypes
+sub main();
+sub usage();
+sub get_opts();
+sub get_dbh($$$;$);
+sub get_table_columns($$);
+sub run_freq($@);
+sub summarize_freq($$);
+sub summarize_freq_column($$@);
+sub print_human_readable_report(@);
+sub table_exists($$);
+sub desc_table($$);
+
+
+# #################################################
+# MAIN
+# #################################################
+sub main() {
+   my @script;     # an array of sql statements
+   my $sql;
+   my $freq;   # frequency temp table
+
+   get_opts();
+
+   # logger & debug settings
+   $ARC::Common::verbose = $opts{verbose};
+   $ARC::Common::E = "$E";   # prefix for error message
+
+   my $dbh = get_dbh($opts{dbname}, $opts{username}, $opts{password}, $opts{host});
+
+   # bail if we can't find the table
+   die("$E: table $opts{table} does not exist\n")
+      unless ( table_exists($dbh, $opts{table}) );
+
+   # describe table and exit
+   if ( exists($opts{desc}) ) {
+      desc_table($dbh, $opts{table});
+      exit(0);
+   }
+
+   # temp freq table name
+   # strip schema component so it's created in user's default scheama.
+   $freq = $opts{table};
+   $freq =~ s/^(.*)\.//;
+   my $schema = $1 || '';
+   $freq = "freq_" . $schema . "_" . $freq;  # keep schema as part of the temp table name
+
+   # if we only want the report, we're done (assuming freq table is still laying around)
+   if ( exists($opts{'report-only'}) ) {
+      my @results = summarize_freq($dbh, $freq);
+      if ( exists($opts{csv}) ) {
+         die "Sorry, CSV report is unimplemented\n";
+      } else {
+         print_human_readable_report(@results);
+      }
+      exit(0);
+   }
+
+   if ( exists($opts{force}) ) {
+      $sql  = "SET client_min_messages=WARNING;\n";
+      $sql .= "drop table if exists $freq;\n";
+      $sql .= "SET client_min_messages=NOTICE";
+      push(@script, $sql);
+   } else {
+      die("$E: temporary freq table $freq already exists.  Use --force to drop\n")
+         if ( table_exists($dbh, $freq) );
+   }
+
+   $sql = "create table $freq "
+        . "(col_name text, col_value text, col_count bigint)";
+   push(@script, $sql);
+
+   # create a "count(*) group by" query for each column we are freqing
+   my @cols = get_table_columns($dbh, $opts{table});
+   foreach my $col (@cols) {
+      $sql = "insert into $freq (col_name, col_value, col_count) "
+           . "select '$col'::text, coalesce(${col}::text,'$null_str'), count(*) from $opts{table} "
+           . "group by $col";
+      push(@script, $sql);
+   }
+
+   # run all the freq counts
+   run_freq($dbh, @script);
+
+   # summarize freq counts
+   edbg(1, "Generating report\n");
+   my @results = summarize_freq($dbh, $freq);
+
+   # print results
+   if ( exists($opts{csv}) ) {
+      die "Sorry, CSV report is unimplemented\n";
+   } else {
+      print_human_readable_report(@results);
+   }
+
+   if ( $opts{cleanup} ) {
+      edbg(1, "Dropping temp table $freq\n");
+      $sql = "drop table $freq";
+      print STDERR $sql . ";\n\n" if ($opts{verbose} > 1);
+      $dbh->do($sql) || die($DBI::errstr);
+   }
+
+}
+
+
+
+
+# #################################################
+# FUNCTIONS
+# #################################################
+
+# ---------------------------------------------------------------------------
+# run freq sql
+# ---------------------------------------------------------------------------
+sub run_freq($@) {
+   my ($dbh, @script) = @_;
+   my $colname = '';
+
+   foreach my $sql (@script) {
+      
+      # parse out the column name - should be smarter about this...
+      if ( $opts{verbose} >= 1 ) {
+         $sql =~ m/select '(.*)'::/;
+         $colname = $1;
+         edbg(1, "Analyzing column $colname\n") if ( $colname );
+      }
+      print STDERR $sql . ";\n\n" if ($opts{verbose} > 1);
+      $dbh->do($sql) || die("$DBI::errstr\n");
+   }
+
+
+}
+
+# ---------------------------------------------------------------------------
+# return true if the table exists
+# ---------------------------------------------------------------------------
+sub table_exists($$) {
+   my ($dbh, $table) = @_;
+
+   my ($schema, $tbl) = ($table =~ m/\./ ) ? split(/\./, $table) : ('', $table);
+   my $sth = $dbh->table_info("", $schema, $tbl, "TABLE");
+   unless ( $sth->fetch() ) {
+      $sth->finish;
+      return 0;
+   }
+   $sth->finish;
+
+   return 1;
+}
+
+# ---------------------------------------------------------------------------
+# print table describe
+# ---------------------------------------------------------------------------
+sub desc_table($$) {
+   my ($dbh, $table) = @_;
+
+   my ($schema, $tbl) = ($table =~ m/\./ ) ? split(/\./, $table) : ('', $table);
+
+   # bail if we can't find the table
+   die("$E: Table $schema.$tbl doesn't exist\n")
+     unless( table_exists($dbh, "$schema.$tbl") );
+ 
+#   my $sth = $dbh->table_info(undef, $schema, $tbl, "TABLE");
+   my $sth = $dbh->column_info(undef, $schema, $tbl, undef);
+   for my $col (@{$sth->fetchall_arrayref({})}) {
+      #print Dumper($col);
+      print uc($col->{COLUMN_NAME}) . " " . $col->{pg_type} . "\n";
+   }
+   $sth->finish;
+}
+
+# ---------------------------------------------------------------------------
+# print frequency report for the given column
+# ---------------------------------------------------------------------------
+sub print_human_readable_report(@) {
+   my (@data) = @_;
+
+   # The @data data structure
+   #
+   # @data = (
+   #   {
+   #      tbl_name       => $tbl_name,
+   #      tbl_row_cnt    => $tbl_row_cnt,
+   #      col_name       => $col_name,
+   #      pct_poplulated => $pct_populated,
+   #      distinct_cnt   => $distinct_cnt,
+   #      minvalue       => $minval,
+   #      maxvalue       => $maxval,
+   #      value_summary  => [
+   #                           [$count, $percent, $value],
+   #                           [$count, $percent, $value],
+   #                           [$count, $percent, $value],
+   #                           ...
+   #                        ]
+   #   },
+   #   ...
+   # )
+
+   # print header
+   my $tmp = $data[0];  # use general data from first column
+   print "="x70 . "\n";
+   #print "= Frequency report for table " . uc($opts{table}) . "\n";
+   print "= DB Table Frequency Report\n";
+   print "=\n";
+   print "= Table Name        : " . uc($tmp->{tbl_name}) . "\n";
+   print "= Record Count      : " . commify($tmp->{tbl_row_cnt}) . "\n";
+   print "= Display max-values: " . commify($opts{'max-values'}) . "\n";
+   print "="x70 . "\n";
+   print "\n";
+
+   foreach my $colref (@data) {
+      my %col = %$colref;
+
+      #print "$col_name:  ${pct_populated}\% populated, $distinct_cnt distinct values, min:[$minval], max:[$maxval]\n";
+      print "$col{col_name}:\n";
+      print "   Percent populated         : $col{pct_populated}\%\n";
+      print "   Number of distinct values : " . commify($col{distinct_cnt}) . "\n";
+      print "   Min value                 : [$col{minval}]\n";
+      print "   Max value                 : [$col{maxval}]\n";
+      print "   Values summary:\n";
+      print "\n";
+      printf("%13s %8s  %-s\n", 'RECORD'        , '% OF' ,    ' ');
+      printf("%13s %8s  %-s\n", 'COUNT'         , 'TOTAL',    '[VALUE]');
+      printf("%13s %8s  %-s\n", '-------------' , '--------', '-------------');
+
+      my $valsummaryref = $col{value_summary};
+      foreach my $valref ( @$valsummaryref ) {
+         my ($cnt, $pct, $val) = @$valref;
+         printf("%13s %8s  [%-s]\n", commify($cnt), $pct, $val);
+      }
+      print "\n";
+   }
+   
+}
+
+# ---------------------------------------------------------------------------
+# summarize counts for a given column
+# ---------------------------------------------------------------------------
+sub summarize_freq_column($$@) {
+   my ($col_name, $total_recs, @data) = @_;
+   my ($cnt, $val, $pct, $pct_populated, $distinct_cnt, $extra_cnt) = (0,'','',100.00,0,0);
+   my ($minval, $maxval) = (undef, undef);
+   my @value_summary;
+
+
+   # calculate percentages, min/max, etc.
+   foreach my $colref (@data) {
+      ($cnt, $val) = @$colref;
+      $distinct_cnt++;
+      
+      # keep track of min and max
+      if ( $val ne $null_str ) {
+         $minval = $val if ( ! defined($minval) );
+         $minval = ( $minval lt $val ) ? $minval : $val;
+         $maxval = $val if ( ! defined($maxval) );
+         $maxval = ( $maxval gt $val ) ? $maxval : $val;
+      }
+
+      # only keep track of max-values number lines. After that sum up the remaining values
+      if ( $distinct_cnt > $opts{'max-values'} ) {
+         $extra_cnt += $cnt;
+      } else {
+         $pct = sprintf("%6s%%", sprintf("%.2f", ($cnt / $total_recs * 100)));
+         push(@value_summary, [commify($cnt), $pct, $val]);
+         if ( $val eq $null_str ) {
+            $pct_populated = sprintf("%.2f", ( ($total_recs - $cnt) / $total_recs * 100));
+         }
+      }
+   }
+   
+   if ( $extra_cnt > 0 ) {
+      $pct = sprintf("%6s%%", sprintf("%.2f", ($extra_cnt / $total_recs * 100)));
+      push(@value_summary, [commify($extra_cnt), $pct, $extra_str]);
+   }
+
+   $minval = ( defined($minval) ) ? $minval : '';
+   $maxval = ( defined($maxval) ) ? $maxval : '';
+
+   # populate a hashref
+   my $ret = {
+      'tbl_name'        => $opts{table},
+      'tbl_row_cnt'     => $total_recs,
+      'col_name'        => $col_name,
+      'pct_populated'   => $pct_populated,
+      'distinct_cnt'    => $distinct_cnt,
+      'minval'          => $minval,
+      'maxval'          => $maxval,
+      'value_summary'   => \@value_summary,
+   };
+
+   return $ret;
+}
+
+
+# ---------------------------------------------------------------------------
+# print frequency report
+# ---------------------------------------------------------------------------
+sub summarize_freq($$) {
+   my ($dbh, $freq_table) = @_;
+   my @counts;
+   my @cols;
+   my $sql = "";
+
+
+   # first check to see if the report table exists
+   my ($schema, $tbl) = ($freq_table =~ m/\./ ) ? split(/\./, $freq_table) : ('', $freq_table);
+   my $sth = $dbh->table_info("", $schema, $tbl, "TABLE");
+   unless ( $sth->fetch() ) {
+      print "frequency table ${schema}.${tbl} does not exist\n";
+      exit(1);
+   }
+   $sth->finish;
+
+   # fetch report data
+   $sql = "select col_name, col_value, col_count from $freq_table "
+        . "order by col_name, col_count desc";
+   $sth = $dbh->prepare($sql);
+   $sth->execute() || die($DBI::errstr);
+
+   # slurp all rows for a given column name, then call summarize_freq_column()
+   # with the slurped array
+   my $colname = '';
+   my ($val, $total_recs) = ('',0);
+   my @data = ();  # array of hashrefs
+
+   while ( my @row = $sth->fetchrow_array() ) {
+      # if new column, tally up and save column stats
+      if ( uc($row[0]) ne $colname ) {
+         push(@cols, summarize_freq_column($colname, $total_recs, @data)) if ( $colname ne '' );
+         $colname = uc($row[0]);
+         $total_recs = 0;
+         @data = ();
+      }
+
+      # should never hit this since query does coalesce() to $null_str
+      $val = ($row[1]) ? $row[1] : $null_str;
+
+      # save      [count  , value]   as an array ref
+      push(@data, [$row[2], $val]);
+      $total_recs += $row[2];
+   }
+   # tally final column
+   push(@cols, summarize_freq_column($colname, $total_recs, @data));
+
+   $sth->finish;
+
+   return @cols;
+}
+
+
+
+# ---------------------------------------------------------------------------
+# get list of columns for this table
+# ---------------------------------------------------------------------------
+sub get_table_columns($$) {
+   my ($dbh, $table) = @_;
+   my @cols;
+
+   # if user passed in column list, use that
+   if ( exists($opts{columns}) ) {
+      @cols = split(/,/, $opts{columns});
+      return @cols;
+   }
+
+   #
+   # no columns specified by user, get full list of columns for this table
+   # from the db catalog
+   #
+   my ($schema, $tbl) = ($table =~ m/\./ ) ? split(/\./, $table) : ('', $table);
+
+   my $sth = $dbh->column_info(undef, $schema, $tbl, undef);
+   for my $col (@{$sth->fetchall_arrayref({})}) {
+      #print Dumper($col);
+      push(@cols, lc($col->{COLUMN_NAME}));
+   }
+   $sth->finish;
+
+   return @cols;
+}
+
+
+
+# ---------------------------------------------------------------------------
+# open database connection, return handle
+# ---------------------------------------------------------------------------
+sub get_dbh($$$;$) {
+   my ($dbname, $dbuser, $dbpass, $dbhost) = @_;
+
+   # empty host name messes up a connection, so just elminate it from the
+   # string if it was not passed to us
+   my $dbi_str = "DBI:Pg:dbname=$dbname";
+   if ( $dbhost ) {
+      $dbi_str = "DBI:Pg:dbname=$dbname;host=$dbhost";
+   }
+
+   #my $dbh = DBI->connect("DBI:Pg:dbname=$dbname;host=$dbhost",
+   #my $dbh = DBI->connect("DBI:Pg:dbname=$dbname",
+   my $dbh = DBI->connect($dbi_str,
+      $dbuser,$dbpass, {
+         RaiseError        => 1,
+         AutoCommit        => 1,
+         FetchHashKeyName  => "NAME_lc",
+      }) or die("$E: Cannot connect to database $dbname: $DBI::errstr");
+
+   return $dbh;
+}
+
+# ------------------------------------------------------------------------
+# Adds commas to a number for display purposes.
+# ------------------------------------------------------------------------
+sub commify() {
+   local $_  = shift;
+   1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+   return $_;
+}
+
+
+# ---------------------------------------------------------------------------
+# get, verify and set defaults on command line options
+# ---------------------------------------------------------------------------
+sub get_opts() {
+
+   Getopt::Long::Configure('no_ignore_case','no_auto_abbrev','gnu_getopt');
+   my $ok = GetOptions(\%opts,
+      # info options
+      'help|?',
+      'version|V',
+      'verbose|v+',     # the trailing + allows multiple -v 
+      # db info
+      'username|u|U=s',
+      'password|p=s',
+      'dbname|d=s',
+      'host|h=s',
+      # frequency options
+      'table|t=s',      # table to freq
+      'columns|c=s',    # csv list of columns to freq - default freqs all columns
+      'max-values|m=s', # max number of values to report on
+      'csv|C',          # output report in csv format
+      'csv-delim|D=s',  # delimiter to use for csv output format
+      # handy
+      'desc',           # describe table - used as an aid to building custom column lists
+      # persistence of temp stuff
+      'cleanup!',       # drop freq table when finished - on by default - to preserv --nocleanup
+      'force',          # drop freq table if exists - normally failes (unless -r is not used)
+      'report-only|r',  # do not run frequency, just look for the freq table and output report
+   );
+   exit(1) if not $ok;
+   usage() if ( exists($opts{help}) );
+   die("$VERSION\n") if ( exists($opts{version}) );
+
+   # required parms
+   die("$E: --username is a required parameter\n") 
+      unless(exists($opts{username}));
+   die("$E: --dbname is a required parameter\n") 
+      unless(exists($opts{dbname}));
+   die("$E: --table is a required parameter\n") 
+      unless(exists($opts{table}));
+
+   # set defaults
+   $opts{verbose} = 0 unless(exists($opts{verbose}));
+   $opts{host} = '' unless(exists($opts{host}));
+   $opts{cleanup} = 1 unless(exists($opts{cleanup}));
+   $opts{'csv-delim'} = '|' unless(exists($opts{'csv-delim'}));
+   $opts{'max-values'} = 30 unless(exists($opts{'max-values'}));
+   $opts{password} = '' unless(exists($opts{password}));
+
+   #$opts{file} = shift(@ARGV) || '-';
+   #print Dumper(\%opts); die("bye\n");
+}
+
+
+# ------------------------------------------------------------------------
+sub usage() {
+   eval "use Pod::Usage qw( pod2usage )";
+
+   if ( $@ ) {
+       print <<"END";
+
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+* Sorry cannot display help - Pod::Usage was not found.
+* Try running "perldoc $this", or just view the bottom of $this.
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+
+END
+   } else {
+      print "\n";
+      pod2usage( -exitval => 'NOEXIT',
+                 -verbose => 3,
+                 #-output  => '-',
+                 -output  => \*STDOUT,
+               );
+   }
+
+   exit 1;
+}
+
+
+# invoke main
+main;
+
+
+__END__
+
+=pod
+
+=head1 NAME
+
+pgfreq - Runs a frequency analysis on the data in a PostgreSQL table
+
+=head1 USAGE
+
+usage: pgfreq <options> > report.txt
+
+=head1 DESCRIPTION
+
+pgfreq will generate a frequency analysis of data in the given table and print
+its report to stdout.  It does this by running a "select column_name, count(*)
+group by column_name" query for each column in the target table, inserting
+results into a temp "freq" table. It then summarizes data in the temp table,
+calculating percentages, min/max values, etc. and prints the report.
+
+The temp table that is used will be generated in the user's default schema, and
+will be named C<freq_table_name> where C<table_name> is the name of the table
+you are analyzing, with any schema component stripped off.  For example, for
+C<--table ade.foo_table>, the temp table C<freq_foo_table> will be used.
+
+This temp table is normally dropped after the frequency report is generated.
+The options --nocleanup, --force and --report-only affect how this table
+is used.  See the individual option descriptions for more information.
+
+=head1 OPTIONS
+
+=head3 REQUIRED PARAMETERS
+
+=over
+
+=item B<-d,--dbname=NAME>
+
+The database name. Required.
+
+=item B<-u,-U,--username=NAME>
+
+The database user name. Required.
+
+=item B<-t,--table=NAME>
+
+Name of the [schema.]table you want to analyze. Required
+
+=back
+
+=head3 OPTIONAL PARAMETERS
+
+=over
+
+=item B<-p,--password=STRING>
+
+The database user's password. If the B<--passsword> option is not present,
+normal postgresql mechanisms apply, that is we let psql find the password. In
+short, the command line option overrides the PGPASSWORD environment variable,
+which overrides the .pgpass file.  The PGPASSFILE environment variable will
+override the default location and name of $HOME/.pgpass
+
+=item B<-h,--host=NAME>
+
+Specifies the host name of the machine on which the server is running.
+Defaults to 'localhost'.
+
+=item B<-c,--column="col1[,col2,col3,...]">
+
+A comma delimited list of columns you want to analyze.  Default is to analyze
+all columns in the table. It's best to surround the entire list in quotes.
+
+=item B<-m,--max-values=N>
+
+The maximum number of values to display for each column in the "Value Summary"
+section.  Defaults to 30.  If a column has more than N distinct values, then
+the counts for all non-displayed values will be added together and displayed as
+a value of "<all other values>".
+
+=item B<-C,--csv>
+
+Output the report as CSV.  Default format is human readable.
+
+UNIMPLEMENTED - Let me know if this sounds useful
+
+=item B<-D,--csv-delim='C'>
+
+Define the delimiter character for CSV report.  Defaults to '|'
+
+=item B<--desc>
+
+This is a convenience option that will "describe" a table - that is, print out
+all column names and their data type.  This can be handy when trying to build a
+list of specific columns to analyze.
+
+=item B<-?,--help>
+
+Displays this help message.
+
+=item B<-V,--version>
+
+Displays the version information
+
+=item B<-v,--verbose>
+
+Will print additional information to STDERR.
+
+ -v   will output progress information such as which column is being analyzed
+ -vv  will output the sql being executed
+ -vvv no additional information at this time
+
+=back
+
+=head3 QUESTIONABLY USEFUL PARAMETERS
+
+These parameters may be useful under specific circumstances, but would not
+normally be used.
+
+=over
+
+=item B<--cleanup>
+
+This option is on by default.  It causes the temp "freq" table (see DESCRIPTION
+above) to be dropped after the frequency report is generated.  Use --nocleanup
+to preserve the temp table.
+
+=item B<--force>
+
+pgfreq creates a temporary "freq" table (see DESCRIPTION above) used during a
+frequency analysis.  If pgfreq finds a table with the same name (either
+coincidence or one left over from a previous frequency analysis that was not
+cleaned up) it will exit with an error. This options forces pgfreq to drop that
+table and continue normally.
+
+=item B<-r,--report-only>
+
+This option tells pgfreq to generate the frequency report using an existing
+temp "freq" table (see DESCRIPTION above) rather than rerun the frequency
+analysis "group by" queries. The only way this can work is if you have
+previously run pgfreq on a table, using the C<--nocleanup> option (see above).
+
+=back
+
+=head1 EXAMPLES
+
+ # generate a frequency report on all columns of ADE's STG_ITBS_KG table
+ # pipe output through unix2dos and save in the file stg_itbs_kg_freq.txt
+ # show progress while running
+
+ pgfreq -v -u mjeffe -d trusted -t ade.stg_itbs_kg | unix2dos > stg_itbs_kg_freq.txt
+
+ # generate frequency report on the columns "ADMIN", "ASSESSMENT" and "PROFICIENCY"
+ # of the ASS_MASTER table. Only output the top 10 values for each column
+
+ pgfreq -u mjeffe -d trusted -c 'admin,assessment,proficiency' -m 10 -t ass_master > ass_master_freq.txt
+
+ # describe the FOO table
+
+ pgfreq -u mjeffe -d trusted -t foo --desc
+
+
+=head1 BUGS
+
+Please report bugs or enhancement requests to Matt Jeffery - C<matt.jeffery@arkansas.gov>.
+
+=cut
+
+ 
+
+

@@ -1,0 +1,690 @@
+#!/usr/bin/perl
+# ---------------------------------------------------------------------------
+# $Id$
+#
+# load a CSV file into PostgreSQL
+#
+# It's very frustrating that pg_load doesn't have a CSV mode...
+#
+# TODO:
+#  - Need to add some output messages - x number loaded, etc. Make current -v a -vv
+#
+# Dependencies:
+#
+# 1) None that I know of, but if you find one missing for example DBD::Pg
+#    then find the package to install using:
+#
+#       sudo yum search perl | grep -i DBD
+#
+#    And install it
+#
+#       sudo yum install perl-DBD-Pg
+#
+# ---------------------------------------------------------------------------
+
+use strict;
+use warnings;
+
+
+use FileHandle;
+use File::Basename;
+use Getopt::Long;
+use File::Temp qw/ tempfile tempdir mktemp /;
+use Data::Dumper;
+
+# globals
+my $this = basename($0);
+my $VERSION = '$Id$';
+my %opts = ();
+my $E = "$this ERROR";   # prefix for error message
+
+# autoflush stdout so that progress can be watched accurately
+# Use $| = 1; if not use'ing FileHandle.
+STDOUT->autoflush(1);
+
+# prototypes
+sub usage();
+sub get_opts();
+sub run_load();
+sub get_copyfrom_tempfile();
+sub system_call($$);
+sub open_ro_file($);
+sub get_file_layout($);
+sub create_table($);
+sub get_record($);
+
+
+# #################################################
+# MAIN
+# #################################################
+
+get_opts();
+run_load();
+
+
+
+
+# #################################################
+# FUNCTIONS
+# #################################################
+
+
+# ---------------------------------------------------------------------------
+# open file and return reference to file handle.
+# can handle compressed files.
+sub open_ro_file($) {
+   my ($file) = @_;
+
+   print "Opening file: $file\n" if ( $opts{verbose} > 1 );
+
+   # Newer versions of Perl already do this, but just to be safe...
+   if ( $file eq '-' ) {
+      return \*STDIN;
+   }
+
+   if ( $file =~ m/.gz$/ ) {
+      open(INPUT, "gzip -dcf $file |") or die "Can't open file $file: $!\n";
+   } else {
+      open(INPUT, "<", $file) or die "Can't open file $file: $!\n";
+   }
+
+   return \*INPUT;
+}
+
+
+# ---------------------------------------------------------------------------
+# close an open file handle
+sub close_file($) {
+   my ($fh) = @_;
+
+   if ( $fh == \*STDIN || $fh == \*STDOUT ) {
+      return;
+   }
+   close($fh) or die "Can't close input file: $!\n";
+}
+
+
+
+# ---------------------------------------------------------------------------
+# grabs one line from the open file handle
+# expects an open filehandle parameter
+# not recommended for reading an entire file, but useful for grabbing the header row
+sub get_record($) {
+   my ($fh) = @_;
+   die("$E: get_record() called with an invalid file handle\n") if ( ! fileno($fh) );
+   chomp(my $record = <$fh>);
+   return $record;
+}
+
+# ---------------------------------------------------------------------------
+# parses header row and calculates field lengths for input file
+# expects a filename parameter
+# returns an AofH data structure (see bottom of this function)
+# ---------------------------------------------------------------------------
+sub get_file_layout($) {
+   my ($file) = @_;
+
+   my @fields;
+   my @dmax;
+
+   if ( $opts{header} ) {
+      # get the header row, parse out and normalize field names
+      my $fh = open_ro_file($file);
+      my $header = get_record($fh);
+
+      # normalize the field names
+      #$header =~ s/\r?\n$//;   # get_record() chomps, so this doesn't work
+      $header =~ s/\r//g;
+      $header =~ s/"//g;
+      $header =~ s/[^a-zA-Z0-9$opts{delimiter}]/_/g;
+      $header =~ tr/A-Z/a-z/;
+      @fields = split(quotemeta($opts{delimiter}), $header);
+
+      # one more step.  column names MUST begin with alpha or _
+      @fields = map {s/^([^A-Za-z_])/_$1/; $_} @fields;
+      close_file($fh);
+   }
+   elsif ( ! exists($opts{scan}) ) {
+      # if no header row, and --scan is not used, we can't depend on dmax to tell
+      # us how many fields there are, so just grab a row and parse it
+      my $fh = open_ro_file($file);
+      my $row = get_record($fh);
+      my @tmp = split(quotemeta($opts{delimiter}), $row);
+      my $field_cnt = scalar @tmp;
+      for (my $i=0; $i < $field_cnt; $i++) {
+         push(@fields, 'field' . $i);
+      }
+      close_file($fh);
+   }
+
+   if ( exists($opts{scan}) ) {
+      # pipe the the file to dmax (which calculates max field lengths).  
+      # NOTE: we suffer some performance by doing it this way, rather than just
+      # invoking dmax on the file. Doing that would include the header in
+      # dmax's calculation.  Really need to alter dmax to take a --header
+      # option!
+      my $fh = open_ro_file($file);
+
+      # throw away the header - don't want it used in max len calculations
+      if ( $opts{header} ) {
+         my $header = get_record($fh);
+      }
+
+      # use tmpdir so we don't have to unlink
+      my $tmp_dir = tempdir(CLEANUP => 1);
+      # mktemp just gives me a file name to use in popen call.
+      my $dmax_tmpfile = mktemp($tmp_dir . '/dmax.XXXXXX');
+      print "dmax_tmpfile: $dmax_tmpfile\n" if ( $opts{verbose} >= 2 );
+
+      open(DMAX, "| dmax -d '$opts{delimiter}' > $dmax_tmpfile") 
+         or die "$E: problem calculating field lengths using dmax :$!\n";
+      while (my $line = <$fh>) {
+         print DMAX $line;
+      }
+      close(DMAX) or die("$E: can't close dmax_tmpfile:$!\n");
+      close_file($fh);
+
+      # now read dmax output
+      $fh = open_ro_file($dmax_tmpfile);
+      #my @dmax = <$fh>;
+      while (my $line = <$fh>) {
+         chomp($line);
+         # deal with empty fields - when a field is empty (foo|bing||bar), dmax returns 0)
+         if ( $line =~ m/^0$/ ) {
+            push(@dmax, '1')
+         } else {
+            push(@dmax, $line);
+         }
+      }
+      close_file($fh);
+
+      # validate/create field names
+      if ( $opts{header} ) {
+         # validate that we got just as many dmax entries as we have field entries
+         if ( scalar @fields != scalar @dmax ) {
+            die("$E: dmax did not return the same number of fields as found in header row\n");
+         }
+      }
+      else {
+         # generate generic field names based on the number of fields dmax found
+         for (my $i=0; $i < scalar @dmax; $i++) {
+            push(@fields, 'field' . $i);
+         }
+      }
+   }
+
+   # build the layout data structure
+   my @layout;   # AofH
+   for (my $i=0; $i < scalar @fields; $i++) {
+      if ( exists($opts{scan}) ) {
+         push(@layout, { 'field_name' => $fields[$i], 'field_len' => $dmax[$i] });
+      } else {
+         push(@layout, { 'field_name' => $fields[$i] });
+      }
+   }
+
+   return \@layout;
+}
+
+
+
+# ---------------------------------------------------------------------------
+# generates a temp file with the COPY FROM command and returns the file name
+# ---------------------------------------------------------------------------
+sub get_copyfrom_tempfile() {
+
+   my $sql = "";
+
+   # set role
+   if ( exists($opts{role}) ) {
+      $sql .= 'set role ' . $opts{role} . ";\n\n";
+   }
+
+   #
+   # create table
+   #
+   if ( exists($opts{create}) ) {
+      if ( exists($opts{drop}) ) {
+         # supporess anoying "NOTICE: table foo does not exist, skipping" messages
+         $sql .= "SET client_min_messages=WARNING;\n";
+         $sql .= "drop table if exists $opts{table};\n";
+         $sql .= "SET client_min_messages=NOTICE;\n\n";
+      }
+      $sql .= "create table $opts{table}";
+
+      my $layout = get_file_layout($opts{file});
+      #print Dumper($layout); die("bye\n");
+
+      my @tmp;
+      foreach my $hashref (@$layout) {
+         #push(@tmp, $hashref->{'field_name'} . " varchar(" . $hashref->{'field_len'} . ")");
+         my $str = $hashref->{'field_name'};
+         if ( exists($hashref->{'field_len'}) ) {
+            $str .= " varchar(" . $hashref->{'field_len'} . ")";
+         } else {
+            $str .= " text";
+         }
+         push(@tmp, $str);
+      }
+      $sql .= " (\n   " . join(",\n   ", @tmp) . "\n);\n\n";
+   }
+
+   #
+   # truncate
+   #
+   if ( exists($opts{'truncate'}) ) {
+      $sql .= "truncate table $opts{table};\n\n";
+   }
+
+   # workaround for a bug in psql.  See:
+   #   http://postgresql.1045698.n5.nabble.com/BUG-6452-psql-can-t-change-client-encoding-from-the-command-line-td5478477.html
+   # setting encoding from psql command line:
+   #   "--set ENCODING=FOO"
+   # does not work.  So for now, we set it here in the sql, which does work! :)
+   # equivalent to running "export PGCLIENTENCODING=LATIN1" in the shell before psql
+   # equivalent to running "export PGCLIENTENCODING=WIN1252" in the shell before psql
+   if ( exists($opts{charset}) ) {
+      $sql .= '\encoding ' . $opts{charset} . ";\n\n";
+   }
+
+   # list of columns
+   my @cols;
+   if ( exists($opts{header}) ) {
+      my $layout = get_file_layout($opts{file});
+      foreach my $hashref (@$layout) {
+         push(@cols, $hashref->{'field_name'});
+      }
+   }
+
+   #
+   # copy from
+   #
+   $sql .= '\copy ' . $opts{table};
+   $sql .= ' (' . join(',', @cols) . ')' if ( exists($opts{header}) );
+   $sql .= " from pstdin with delimiter '$opts{delimiter}'";
+   $sql .= " null as '$opts{nullas}'" if ( exists($opts{nullas}) );
+   $sql .= " csv";
+   $sql .= " header" if ( $opts{header} );
+   $sql .= " quote '$opts{quote}'" if ( exists($opts{quote}) );
+   $sql .= " escape '$opts{escape}'" if ( exists($opts{escape}) );
+   # only works in 9.1
+   #$sql .= " force not null *" if ( exists($opts{'force-quote'}) );
+   $sql .= " force not null $opts{'force-not-null'}" if ( exists($opts{'force-not-null'}) );
+   #$sql .= ';';    # do NOT use ; for \copy command!
+   $sql .= "\n\n";
+   $sql .= "analyze $opts{table};\n";
+
+   # output sql options
+   if ( exists($opts{'output-sql'}) ) {
+      open(OF, '>', $opts{'output-sql'}) or die("Can't open $opts{'output-sql'} file for writing\n");
+      print OF "$sql\n";
+      close(OF);
+   }
+   if ( exists($opts{'sql-only'}) ) {
+      print STDOUT "$sql\n";
+      exit(0);
+   }
+
+   # write to temp file
+   my ($fh, $filename) = tempfile(UNLINK => 1, SUFFIX => '.sql');
+   #my ($fh, $filename) = tempfile(UNLINK => 0, SUFFIX => '.sql');
+   print $fh "$sql\n";
+
+   return $filename;
+}
+
+
+# ---------------------------------------------------------------------------
+# Invokes psql with COPY FROM tempfile, writing to stdout
+# ---------------------------------------------------------------------------
+sub run_load() {
+
+   my $sqlfile = get_copyfrom_tempfile();
+
+   # yeah, yeah... "unsafe" to export the password.  Well don't run your damn
+   # database on an unsafe server!
+   # we only export if we had a command line pw, otherwise assume env vars
+   # or have been exported or .pgpass file exists, and let psql handle it
+   $ENV{PGPASSWORD} = $opts{password} if ( exists($opts{password}));
+
+   my $cmd = "unset PGOPTIONS && cat '$opts{file}' | ";
+
+   # convert from dos format
+   if ( exists($opts{dos}) ) {
+      $cmd .= ' perl -pe \'s/\r\n$/\n/;\' | ';
+   }
+
+   $cmd .= "psql --set ON_ERROR_STOP=on --pset pager=off -X";
+   if ( $opts{verbose} ) {
+      $cmd .= " -a ";
+   } else {
+      $cmd .= " -q ";
+   }
+   $cmd .= " -h $opts{host}" if ( $opts{host} );
+   $cmd .= " -U $opts{username} -d $opts{dbname} -f $sqlfile";
+
+   # due to a bug in psql, this does not work.  See workaround
+   # in the get_copyfrom_tempfile() function
+   #
+   # exquivalent to running "export PGCLIENTENCODING=LATIN1" in the shell before psql
+   #if ( defined($opts{charset}) ) {
+   #   $cmd .= " --set ENCODING=" . $opts{charset};
+   #}
+
+   system_call($cmd, "psql");
+}
+
+
+
+# ---------------------------------------------------------------------------
+#  Run system command
+# ---------------------------------------------------------------------------
+sub system_call($$) {
+   my ($cmd, $app) = @_;
+
+   print "CMD: $cmd\n" if ( $opts{verbose} >= 2 );
+   my $rc = system($cmd);
+   if ( ($rc >>= 8) != 0 ) {
+      die("$E: $app failed with return code $?: $!\n");
+   }
+}
+
+
+# ---------------------------------------------------------------------------
+# get, verify and set defaults on command line options
+sub get_opts() {
+
+   Getopt::Long::Configure('no_ignore_case','no_auto_abbrev','gnu_getopt');
+   my $ok = GetOptions(\%opts,
+      # info options
+      'help|?',
+      'version|V',
+      'verbose|v+',     # the trailing + allows multiple -v 
+      # db info
+      'username|u|U=s',
+      'password|p=s',
+      'dbname|d=s',
+      'host|h=s',
+      # input file options
+      'header!',        # file has header row
+      'dos!',           # strip windows line terminators \r\n
+      'delimiter|D=s',  # define the delimiter character
+      'quote|q=s',      # define the quote character
+      'escape|e=s',     # define the escape character
+      'nullas=s',       # define the NULL string
+      'force-not-null|N=s',  # force not null on these columns
+      # TODO: this one should be intelligently combined with the "dos" option
+      'windows|w',      # This is a windows file, try loading as latin1 (or windows-1252) charset
+      'charset=s',      # define the charset of the file
+      # other options
+      'table|t=s',      # table name to load
+      'create|c',       # create table (use header row as field names, calculate max field lengths, etc)
+      'drop',           # drop table if exists - will only work if --create is also used
+      'truncate',       # truncate table before loading
+      'role|r=s',       # assume this role when loading (issues: "set role <role>;" before loading)
+      'output-sql|o=s', # output sql to file name
+      'sql-only',       # output sql only, do not load
+      'scan|s',         # scan file to generate accurate field lengths
+   );
+   exit(1) if not $ok;
+   usage() if ( exists($opts{help}) );
+   die("$VERSION\n") if ( exists($opts{version}) );
+
+   # required parms
+   if ( ! exists($opts{'sql-only'}) ) {
+      die("$E: --username is a required parameter\n") 
+         unless(exists($opts{username}));
+      die("$E: --dbname is a required parameter\n") 
+         unless(exists($opts{dbname}));
+   }
+   die("$E: --table is a required parameter\n") 
+      unless(exists($opts{table}));
+   die("$E: cannot use --drop without --create\n") 
+      if(exists($opts{drop}) && !exists($opts{create}) );
+   die("$E: use either --windows or --charset\n") 
+      if(exists($opts{windows}) && exists($opts{charset}) );
+
+   # set defaults
+   $opts{verbose} = 0 unless(exists($opts{verbose}));
+   $opts{delimiter} = '|' unless(exists($opts{delimiter}));
+   $opts{host} = '' unless(exists($opts{host}));
+   $opts{header} = 1 unless(exists($opts{header}));
+   $opts{dos} = 1 unless(exists($opts{dos}));
+   #$opts{'truncate'} = 1 unless(exists($opts{'truncate'}));
+   #$opts{'charset'} = "LATIN1" if(exists($opts{'windows'}));
+   $opts{'charset'} = "WIN1252" if(exists($opts{'windows'}));
+
+   $opts{file} = shift(@ARGV) || '-';
+
+   #print Dumper(\%opts); die("bye\n");
+}
+
+
+# ------------------------------------------------------------------------
+sub usage() {
+   eval "use Pod::Usage qw( pod2usage )";
+
+   if ( $@ ) {
+       print <<"END";
+
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+* Sorry cannot display help - Pod::Usage was not found.
+* Try running "perldoc $this", or just view the bottom of $this.
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+
+END
+   } else {
+      print "\n";
+      pod2usage( -exitval => 'NOEXIT',
+                 -verbose => 3,
+                 #-output  => '-',
+                 -output  => \*STDOUT,
+               );
+   }
+
+   exit 1;
+}
+
+
+
+__END__
+
+=pod
+
+=head1 NAME
+
+pgloadcsv - loads delimited data file into a PostgreSQL database
+
+=head1 USAGE
+
+usage: pgloadcsv <options> /some/file.csv
+
+=head1 DESCRIPTION
+
+pgloadcsv loads a delimited file into a PostgreSQL database table. It will
+write a temporary SQL file, with a "COPY FROM" command, which it then submits
+to psql.  For more information, see PostgresSQL's COPY command documentation.
+
+pgloadcsv can either load into an existing table, or create the table on the
+fly.
+
+Using the B<--sql-only> and B<--scan> options can be usefull for generating
+create table SQL without actually loading any data.
+
+=head1 OPTIONS
+
+=over
+
+=item B<-d,--dbname=NAME>
+
+The database name. Required.
+
+=item B<-u,-U,--username=NAME>
+
+The database user name. Required.
+
+=item B<-p,--password=STRING>
+
+The database user's password. If the B<--passsword> option is not present,
+normal postgresql mechanisms apply, that is we let psql find the password. In
+short, the command line option overrides the PGPASSWORD environment variable,
+which overrides the .pgpass file.  The PGPASSFILE environment variable will
+override the default location and name of $HOME/.pgpass
+
+=item B<-h,--host=NAME>
+
+Specifies the host name of the machine on which the server is running.
+Defaults to 'localhost'.
+
+=item B<-t,--table='table_name'>
+
+Name of the [schema.]table to load.  Either an existing table or the name of
+the table you want pgloadcsv to create.  Required.
+
+See also B<--create>, B<--drop>, B<--scan>, B<--truncate>
+
+=item B<-D,--delimiter='C'>
+
+Define the delimiter character.  Defaults to '|'
+
+=item B<-q,--quote='C'>
+
+Define the quote character.  Defaults to '"'
+
+=item B<-e,--escape='C'>
+
+Define the escape character.  Defaults to '"'
+
+=item B<--header>
+
+ON BY DEFAULT.  Header row with field names is present as the first row in the
+file.  Use B<--noheader> if the file has no header row. When B<--create> is
+used to generate "CREATE TABLE" sql, the header row is used for field names,
+and is skipped when using B<--scan>.
+
+=item B<-r,--role='ROLE'>
+
+Sets the user's database role to ROLE before creating or loading anything.
+This allows you to authenticate as B<--username> but then load data as
+the new role.  This assumes the user has permission to "set role ROLE".
+
+=item B<-w,--windows>
+
+This is a character set conversion flag. It causes pgloadcsv to set the
+PostgreSQL variable CLIENT_ENCODING=WIN1252.
+
+If you don't know the character set of the data file (almost no one ever does)
+and your load fails with PostgreSQL complaining about invalid characters for
+the database character set, try using this flag. If this doesn't work, try
+using:
+
+B<--charset=LATIN1>
+
+See also B<--charset>
+
+=item B<-c,--create>
+
+By default pgloadcsv will load that data into an existing table.  Using
+this option will cause pgloadcsv to generate and execute "CREATE TABLE" SQL before
+before loading the file.  
+
+Several options affect how the create table sql is generated.  Field names
+can be taken from a header row (assumed by default) or generated as generic
+"field0, field1, ...".  By default, pgcsvload will simply use a "text" data
+type for every field.  If the B<--scan> option is used, pgcsvload will scan the
+entire file and calculate the max length of each field. It will then use
+appropriate "varchar(length)" data types for each field.
+
+See also B<--scan>, B<--header>.
+
+=item B<-s,--scan>
+
+Scan the entire file before loading, in order to calculate the max lenght of each
+field.  By default, the create table sql generated by pgloadcsv will use
+"text" datatype fields.  Using B<--scan>, will cause the create table sql to
+use "varchar(max_lenght)" data types instead.
+
+TODO: do a more detailed "format" scan, and choose more appropriate data types
+such as numeric, date, timestamp, etc.
+
+=item B<--drop>
+
+Generate and execute a "DROP TABLE" statement before loading the file.  Note,
+this option will only be allowed if the --create option is also present.  This
+is to prevent dropping a table that we don't know how to recreate.
+
+=item B<--truncate>
+
+Truncate the table before loading.
+
+=item B<-o,--output-sql='filename'>
+
+Save the SQL pgloadcsv generates to the file 'filename'.  Normally, any SQL that
+is used is generated in a temporary file and then removed once the file is loaded.
+This option allows you to save that sql for logging or debugging purposes.
+
+=item B<--charset=PG_CHARSET>
+
+This is a character set conversion flag. It causes pgloadcsv to set the
+PostgreSQL variable CLIENT_ENCODING=PG_CHARSET, where PG_CHARSET is one
+of the valid CLIENT character set encodings for PostggreSQL. See the
+Character Set Support documentation.  For example:
+
+ http://www.postgresql.org/docs/8.4/static/multibyte.html
+
+See also B<--windows>
+
+=item B<--nullas='STRING'>
+
+Ouput nulls as STRING.  Normally a null would just be an empty string, but you
+can specify some string to use instead. See NULL AS option to PostgresSQL's
+COPY command.
+
+=item B<-Q,--force-not-null='column1[,column2,...]'>
+
+Force listed columns to be processed as if they were quoted, and hence not a
+null value.  Normaly, an empty field would be loaded as a null, but this option
+causes it to be loaded as though it were '', or a zero-length string.
+
+Having to list the columns is a retarded way to implement this, but
+it's due to the limitations of PostgreSQL's COPY command.  In PG 9.1, you can
+now specify '*' as the column list, but in 8.4 we have to list out the columns
+you want quoted.
+
+=item B<--dos>
+
+Strip \r from data file.  Data file is a DOS (Microsoft Windows) file (records
+terminated with \r\n) and needs carriage returns stripped before loading.  This
+is on by default. 
+
+=item B<--sql-only>
+
+With this option, pgloadcsv will NOT load any data, but will dump to STDOUT any
+SQL that pgloadcsv would use to execute the given set of options.  This is sort
+of a verbose, dry-run option, although it's also handy for generating 'CREATE
+TABLE' statements.
+
+=item B<-?,--help>
+
+Displays this help message.
+
+=item B<-V,--version>
+
+Displays the version information
+
+=item B<-v,--verbose>
+
+Will print additional information to STDOUT, such as the generated SQL, the psql
+the psql command line call, etc.
+
+=back
+
+=head1 BUGS
+
+Please report bugs or enhancement requests to Matt Jeffery - C<matt.jeffery@arkansas.gov>.
+
+=cut
+
+ 
+
+
