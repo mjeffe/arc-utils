@@ -3,11 +3,11 @@
 # Extract a file from PostgreSQL as CSV. This is just a convenience wrapper
 # for psql, that makes extracting CSV a one-liner. It invokes psql with a
 # COPY TO tempfile which it builds on the fly.
-# 
+#
 # It's very frustrating that pg_dump doesn't have a CSV mode...
-# 
+#
 # Run this script with the --help options for full description
-# 
+#
 # Dependencies:
 #
 # 1) PostgresSQL of course, and the Perl DBD driver (DBD::Pg). To install the
@@ -135,6 +135,7 @@ sub run_extract() {
    my $cmd = "unset PGOPTIONS && "
            . "psql --pset pager=off -X -U $opts{username} -d $opts{dbname} -f $sqlfile";
    $cmd .= " -h $opts{host}" if ( exists($opts{host}) );
+   $cmd .= " -p $opts{port}" if ( exists($opts{port}) );
 
    # convert to dos format
    if ( exists($opts{dos}) ) {
@@ -179,6 +180,7 @@ sub get_opts() {
       'password|p=s',
       'dbname|d=s',
       'host|h=s',
+      'port=s',
       # output file options
       'verbose|v+',     # the trailing + allows multiple -v 
       'header!',        # include header in output
@@ -211,6 +213,7 @@ sub get_opts() {
    $opts{verbose} = 0 unless(exists($opts{verbose}));
    $opts{delimiter} = '|' unless(exists($opts{delimiter}));
    #$opts{host} = 'localhost' unless(exists($opts{host}));
+   #$opts{port} = 'localhost' unless(exists($opts{port}));
    $opts{header} = 1 unless(exists($opts{header}));
 
    #print Dumper(\%opts); die("bye\n");
@@ -286,6 +289,10 @@ override the default location and name of $HOME/.pgpass
 =item B<-h,--host=NAME>
 
 Specifies the host name of the machine on which the server is running.
+
+=item B<--port=PORT>
+
+Optionally specify the host port for the connection.
 
 =item B<-t,--table=NAME>
 
@@ -364,7 +371,7 @@ Dump the B<users> table as comma delimited, provide the password (useful from sc
 =begin text
 
         pgdumpcsv -d foodb -u mjeffe -t users -D ',' -p asdf > users.csv
-    
+
 =end text
 
 Dump the output of sql as pipe delimited (default). Let psql prompt for password.
@@ -373,7 +380,7 @@ Dump the output of sql as pipe delimited (default). Let psql prompt for password
 
         pgdumpcsv -d foodb -u mjeffe \
             -s 'select u.uid, r.rid from users u join roles r on u.uid = r.uid' > roles.csv
-     
+
 =end text
 
 
@@ -384,7 +391,7 @@ Dump foo report as tab delimited, without the column names header row.
         # enter the tab character using ctrl-v + tab, it must be in single quotes
         pgdumpcsv -d foodb -u mjeffe \
             -f foo_report.sql -D '	' --noheader > foo_report.csv
-    
+
 =end text
 
 =head1 BUGS

@@ -373,6 +373,7 @@ sub run_load() {
       $cmd .= " -q ";
    }
    $cmd .= " -h $opts{host}" if ( $opts{host} );
+   $cmd .= " -p $opts{port}" if ( $opts{port} );
    $cmd .= " -U $opts{username} -d $opts{dbname} -f $sqlfile";
 
    # due to a bug in psql, this does not work.  See workaround
@@ -417,6 +418,7 @@ sub get_opts() {
       'password|p=s',
       'dbname|d=s',
       'host|h=s',
+      'port=s',
       # input file options
       'header!',        # file has header row
       'dos!',           # strip windows line terminators \r\n
@@ -460,6 +462,7 @@ sub get_opts() {
    $opts{verbose} = 0 unless(exists($opts{verbose}));
    $opts{delimiter} = '|' unless(exists($opts{delimiter}));
    $opts{host} = '' unless(exists($opts{host}));
+   $opts{port} = '' unless(exists($opts{port}));
    $opts{header} = 1 unless(exists($opts{header}));
    $opts{dos} = 1 unless(exists($opts{dos}));
    #$opts{'truncate'} = 1 unless(exists($opts{'truncate'}));
@@ -547,6 +550,10 @@ override the default location and name of $HOME/.pgpass
 
 Specifies the host name of the machine on which the server is running.
 Defaults to 'localhost'.
+
+=item B<--port=PORT>
+
+Optionally specify the host port for the connection.
 
 =item B<-t,--table='table_name'>
 
